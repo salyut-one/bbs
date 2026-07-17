@@ -19,11 +19,10 @@ pub enum Request {
         title: String,
         body: String,
     },
-    CreatePoll {
+    CreateProposal {
         board: String,
         title: String,
         body: String,
-        options: Vec<String>,
     },
     UpdatePost {
         id: i64,
@@ -52,6 +51,17 @@ pub enum Request {
         id: i64,
         locked: bool,
     },
+    WithdrawProposal {
+        id: i64,
+    },
+    VetoProposal {
+        id: i64,
+        reason: String,
+    },
+    MarkProposalImplemented {
+        id: i64,
+        note: String,
+    },
 }
 
 impl Request {
@@ -59,7 +69,7 @@ impl Request {
         matches!(
             self,
             Self::CreatePost { .. }
-                | Self::CreatePoll { .. }
+                | Self::CreateProposal { .. }
                 | Self::UpdatePost { .. }
                 | Self::DeletePost { .. }
                 | Self::CastVote { .. }
@@ -67,6 +77,9 @@ impl Request {
                 | Self::UpdateReply { .. }
                 | Self::DeleteReply { .. }
                 | Self::SetPostLocked { .. }
+                | Self::WithdrawProposal { .. }
+                | Self::VetoProposal { .. }
+                | Self::MarkProposalImplemented { .. }
         )
     }
 }
@@ -98,8 +111,53 @@ pub struct Post {
     pub locked: bool,
     pub replies: Vec<Reply>,
     pub poll: Option<Poll>,
+    pub proposal: Option<Proposal>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalState {
+    Voting,
+    Accepted,
+    Rejected,
+    Withdrawn,
+    Vetoed,
+    Implemented,
+}
+
+impl ProposalState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Voting => "voting",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Withdrawn => "withdrawn",
+            Self::Vetoed => "vetoed",
+            Self::Implemented => "implemented",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Proposal {
+    pub state: ProposalState,
+    pub opens_at: DateTime<Utc>,
+    pub closes_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub events: Vec<ProposalEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProposalEvent {
+    pub id: i64,
+    pub from_state: Option<ProposalState>,
+    pub to_state: ProposalState,
+    pub actor_uid: Option<u32>,
+    pub actor: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +190,7 @@ pub struct PostSummary {
     pub author: String,
     pub title: String,
     pub is_poll: bool,
+    pub proposal_state: Option<ProposalState>,
     pub locked: bool,
     pub reply_count: u32,
     pub created_at: DateTime<Utc>,
@@ -159,6 +218,7 @@ pub enum Response {
         post_id: i64,
     },
     LockChanged(Post),
+    ProposalChanged(Post),
     Deleted {
         id: i64,
     },

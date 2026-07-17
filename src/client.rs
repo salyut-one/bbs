@@ -76,18 +76,11 @@ impl Client {
         }
     }
 
-    pub fn create_poll(
-        &self,
-        board: &str,
-        title: &str,
-        body: &str,
-        options: Vec<String>,
-    ) -> Result<Post> {
-        match self.call(&Request::CreatePoll {
+    pub fn create_proposal(&self, board: &str, title: &str, body: &str) -> Result<Post> {
+        match self.call(&Request::CreateProposal {
             board: board.to_owned(),
             title: title.to_owned(),
             body: body.to_owned(),
-            options,
         })? {
             Response::Created(post) => Ok(post),
             response => result_error(response),
@@ -149,6 +142,33 @@ impl Client {
     pub fn set_post_locked(&self, id: i64, locked: bool) -> Result<Post> {
         match self.call(&Request::SetPostLocked { id, locked })? {
             Response::LockChanged(post) => Ok(post),
+            response => result_error(response),
+        }
+    }
+
+    pub fn withdraw_proposal(&self, id: i64) -> Result<Post> {
+        match self.call(&Request::WithdrawProposal { id })? {
+            Response::ProposalChanged(post) => Ok(post),
+            response => result_error(response),
+        }
+    }
+
+    pub fn veto_proposal(&self, id: i64, reason: &str) -> Result<Post> {
+        match self.call(&Request::VetoProposal {
+            id,
+            reason: reason.to_owned(),
+        })? {
+            Response::ProposalChanged(post) => Ok(post),
+            response => result_error(response),
+        }
+    }
+
+    pub fn mark_proposal_implemented(&self, id: i64, note: &str) -> Result<Post> {
+        match self.call(&Request::MarkProposalImplemented {
+            id,
+            note: note.to_owned(),
+        })? {
+            Response::ProposalChanged(post) => Ok(post),
             response => result_error(response),
         }
     }

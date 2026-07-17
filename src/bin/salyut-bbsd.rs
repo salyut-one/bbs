@@ -13,7 +13,7 @@ use clap::Parser;
 use salyut_bbs::{
     db::Database,
     peer,
-    protocol::{Board, BoardKind, ErrorCode, Request, Response},
+    protocol::{Board, BoardKind, ErrorCode, ProposalState, Request, Response},
 };
 
 #[derive(Parser)]
@@ -134,6 +134,7 @@ fn dispatch(database: &Mutex<Database>, account: &peer::Account, request: Reques
         let mut database = database
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        database.finalize_due_proposals(chrono::Utc::now())?;
         Ok(match request {
             Request::WhoAmI => Response::Identity {
                 uid: account.uid,
@@ -156,12 +157,9 @@ fn dispatch(database: &Mutex<Database>, account: &peer::Account, request: Reques
             Request::CreatePost { board, title, body } => {
                 create_post(&mut database, account, &board, &title, &body)?
             }
-            Request::CreatePoll {
-                board,
-                title,
-                body,
-                options,
-            } => create_poll(&mut database, account, &board, &title, &body, &options)?,
+            Request::CreateProposal { board, title, body } => {
+                create_proposal(&mut database, account, &board, &title, &body)?
+            }
             Request::UpdatePost { id, title, body } => {
                 update_post(&mut database, account, id, &title, &body)?
             }
@@ -176,6 +174,13 @@ fn dispatch(database: &Mutex<Database>, account: &peer::Account, request: Reques
             Request::DeleteReply { id } => delete_reply(&mut database, account, id)?,
             Request::SetPostLocked { id, locked } => {
                 set_post_locked(&mut database, account, id, locked)?
+            }
+            Request::WithdrawProposal { id } => withdraw_proposal(&mut database, account, id)?,
+            Request::VetoProposal { id, reason } => {
+                veto_proposal(&mut database, account, id, &reason)?
+            }
+            Request::MarkProposalImplemented { id, note } => {
+                mark_proposal_implemented(&mut database, account, id, &note)?
             }
         })
     })();
@@ -196,7 +201,7 @@ fn create_post(
     if board.kind != BoardKind::Discussion {
         return Ok(error(
             ErrorCode::BadRequest,
-            "use a poll when posting to this board",
+            "use a proposal when posting to this board",
         ));
     }
     if !can_write(&board, account) {
@@ -211,30 +216,31 @@ fn create_post(
     )?))
 }
 
-fn create_poll(
+fn create_proposal(
     database: &mut Database,
     account: &peer::Account,
     slug: &str,
     title: &str,
     body: &str,
-    options: &[String],
 ) -> Result<Response> {
     let Some(board) = database.board(slug)? else {
         return Ok(error(ErrorCode::NotFound, "board not found"));
     };
     if board.kind != BoardKind::Polls {
-        return Ok(error(ErrorCode::BadRequest, "polls are not allowed here"));
+        return Ok(error(
+            ErrorCode::BadRequest,
+            "proposals are not allowed here",
+        ));
     }
     if !can_write(&board, account) {
         return Ok(forbidden_for_board(&board));
     }
-    Ok(Response::Created(database.create_poll(
+    Ok(Response::Created(database.create_proposal(
         &board,
         account.uid,
         &account.username,
         title,
         body,
-        options,
     )?))
 }
 
@@ -251,6 +257,12 @@ fn update_post(
     if database.owner_uid(id)? != Some(account.uid) {
         return Ok(error(ErrorCode::Forbidden, "not your post"));
     }
+    if post.proposal.is_some() {
+        return Ok(error(
+            ErrorCode::Forbidden,
+            "proposals cannot be edited after voting begins",
+        ));
+    }
     if !can_write(&post.board, account) {
         return Ok(forbidden_for_board(&post.board));
     }
@@ -266,6 +278,12 @@ fn delete_post(database: &mut Database, account: &peer::Account, id: i64) -> Res
     };
     if database.owner_uid(id)? != Some(account.uid) {
         return Ok(error(ErrorCode::Forbidden, "not your post"));
+    }
+    if post.proposal.is_some() {
+        return Ok(error(
+            ErrorCode::Forbidden,
+            "withdraw proposals instead of deleting them",
+        ));
     }
     if !can_write(&post.board, account) {
         return Ok(forbidden_for_board(&post.board));
@@ -292,8 +310,8 @@ fn cast_vote(
     if !can_write(&post.board, account) {
         return Ok(forbidden_for_board(&post.board));
     }
-    if post.locked {
-        return Ok(error(ErrorCode::Forbidden, "proposal is locked"));
+    if post.proposal.as_ref().map(|proposal| proposal.state) != Some(ProposalState::Voting) {
+        return Ok(error(ErrorCode::Forbidden, "voting is closed"));
     }
     Ok(match database.vote(account.uid, post_id, option_id)? {
         Some(post) => Response::Voted(post),
@@ -373,6 +391,92 @@ fn set_post_locked(
     })
 }
 
+fn withdraw_proposal(
+    database: &mut Database,
+    account: &peer::Account,
+    id: i64,
+) -> Result<Response> {
+    let Some(post) = database.get(id, account.uid)? else {
+        return Ok(error(ErrorCode::NotFound, "proposal not found"));
+    };
+    if database.owner_uid(id)? != Some(account.uid) {
+        return Ok(error(
+            ErrorCode::Forbidden,
+            "only the proposal author may withdraw it",
+        ));
+    }
+    if post.proposal.as_ref().map(|proposal| proposal.state) != Some(ProposalState::Voting) {
+        return Ok(error(
+            ErrorCode::Forbidden,
+            "only a proposal with open voting may be withdrawn",
+        ));
+    }
+    Ok(
+        match database.withdraw_proposal(id, account.uid, &account.username)? {
+            Some(post) => Response::ProposalChanged(post),
+            None => error(ErrorCode::Forbidden, "proposal state changed"),
+        },
+    )
+}
+
+fn veto_proposal(
+    database: &mut Database,
+    account: &peer::Account,
+    id: i64,
+    reason: &str,
+) -> Result<Response> {
+    if !is_wheel(account) {
+        return Ok(error(
+            ErrorCode::Forbidden,
+            "vetoing proposals requires Unix group wheel",
+        ));
+    }
+    let Some(post) = database.get(id, account.uid)? else {
+        return Ok(error(ErrorCode::NotFound, "proposal not found"));
+    };
+    if post.proposal.as_ref().map(|proposal| proposal.state) != Some(ProposalState::Accepted) {
+        return Ok(error(
+            ErrorCode::Forbidden,
+            "only an accepted proposal may be vetoed",
+        ));
+    }
+    Ok(
+        match database.veto_proposal(id, account.uid, &account.username, reason)? {
+            Some(post) => Response::ProposalChanged(post),
+            None => error(ErrorCode::Forbidden, "proposal state changed"),
+        },
+    )
+}
+
+fn mark_proposal_implemented(
+    database: &mut Database,
+    account: &peer::Account,
+    id: i64,
+    note: &str,
+) -> Result<Response> {
+    if !is_wheel(account) {
+        return Ok(error(
+            ErrorCode::Forbidden,
+            "implementing proposals requires Unix group wheel",
+        ));
+    }
+    let Some(post) = database.get(id, account.uid)? else {
+        return Ok(error(ErrorCode::NotFound, "proposal not found"));
+    };
+    if post.proposal.as_ref().map(|proposal| proposal.state) != Some(ProposalState::Accepted) {
+        return Ok(error(
+            ErrorCode::Forbidden,
+            "only an accepted proposal may be marked implemented",
+        ));
+    }
+    Ok(
+        match database.mark_proposal_implemented(id, account.uid, &account.username, note)? {
+            Some(post) => Response::ProposalChanged(post),
+            None => error(ErrorCode::Forbidden, "proposal state changed"),
+        },
+    )
+}
+
 fn can_write(board: &Board, account: &peer::Account) -> bool {
     board
         .write_group
@@ -406,7 +510,7 @@ mod tests {
     use salyut_bbs::{
         db::Database,
         peer::Account,
-        protocol::{Board, BoardKind, ErrorCode, Post, Request, Response},
+        protocol::{Board, BoardKind, ErrorCode, Post, ProposalState, Request, Response},
     };
 
     use super::{can_write, dispatch, is_wheel};
@@ -545,11 +649,10 @@ mod tests {
             dispatch(
                 &database,
                 &account,
-                Request::CreatePoll {
+                Request::CreateProposal {
                     board: "proposals".to_owned(),
                     title: "Add a garden?".to_owned(),
                     body: "A small shared garden behind the server room.".to_owned(),
-                    options: vec!["Yes".to_owned(), "No".to_owned()],
                 }
             ),
             Response::Created(Post {
@@ -557,6 +660,122 @@ mod tests {
                 poll: Some(_),
                 ..
             }) if author == "bob"
+        ));
+    }
+
+    #[test]
+    fn only_author_can_withdraw_an_open_proposal() {
+        let database = Mutex::new(Database::open(Path::new(":memory:")).unwrap());
+        let proposal = {
+            let mut database = database.lock().unwrap();
+            let board = database.board("proposals").unwrap().unwrap();
+            database
+                .create_proposal(&board, 1001, "alice", "Add a garden?", "Plant herbs.")
+                .unwrap()
+        };
+        let alice = Account {
+            uid: 1001,
+            username: "alice".to_owned(),
+            groups: vec!["users".to_owned()],
+        };
+        let bob = Account {
+            uid: 1002,
+            username: "bob".to_owned(),
+            groups: vec!["users".to_owned()],
+        };
+
+        assert!(matches!(
+            dispatch(
+                &database,
+                &bob,
+                Request::WithdrawProposal { id: proposal.id }
+            ),
+            Response::Error {
+                code: ErrorCode::Forbidden,
+                ..
+            }
+        ));
+        assert!(matches!(
+            dispatch(
+                &database,
+                &alice,
+                Request::WithdrawProposal { id: proposal.id }
+            ),
+            Response::ProposalChanged(Post {
+                proposal: Some(proposal),
+                ..
+            }) if proposal.state == ProposalState::Withdrawn
+        ));
+    }
+
+    #[test]
+    fn veto_requires_wheel_and_a_published_reason() {
+        let database = Mutex::new(Database::open(Path::new(":memory:")).unwrap());
+        let proposal = {
+            let mut database = database.lock().unwrap();
+            let board = database.board("proposals").unwrap().unwrap();
+            let proposal = database
+                .create_proposal(&board, 1001, "alice", "Add a garden?", "Plant herbs.")
+                .unwrap();
+            let option = proposal.poll.as_ref().unwrap().options[0].id;
+            database.vote(1001, proposal.id, option).unwrap();
+            database
+                .finalize_due_proposals(proposal.proposal.as_ref().unwrap().closes_at)
+                .unwrap();
+            proposal
+        };
+        let member = Account {
+            uid: 1002,
+            username: "bob".to_owned(),
+            groups: vec!["users".to_owned()],
+        };
+        let operator = Account {
+            uid: 0,
+            username: "root".to_owned(),
+            groups: vec!["wheel".to_owned()],
+        };
+
+        assert!(matches!(
+            dispatch(
+                &database,
+                &member,
+                Request::VetoProposal {
+                    id: proposal.id,
+                    reason: "No space.".to_owned(),
+                }
+            ),
+            Response::Error {
+                code: ErrorCode::Forbidden,
+                ..
+            }
+        ));
+        assert!(matches!(
+            dispatch(
+                &database,
+                &operator,
+                Request::VetoProposal {
+                    id: proposal.id,
+                    reason: String::new(),
+                }
+            ),
+            Response::Error {
+                code: ErrorCode::BadRequest,
+                ..
+            }
+        ));
+        assert!(matches!(
+            dispatch(
+                &database,
+                &operator,
+                Request::VetoProposal {
+                    id: proposal.id,
+                    reason: "Exceeds available space.".to_owned(),
+                }
+            ),
+            Response::ProposalChanged(Post {
+                proposal: Some(proposal),
+                ..
+            }) if proposal.state == ProposalState::Vetoed
         ));
     }
 }

@@ -6,7 +6,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use salyut_bbs::{
     client::Client,
-    protocol::{Board, BoardKind, Post, PostSummary},
+    protocol::{Board, BoardKind, Post, PostSummary, ProposalState},
 };
 
 mod ui;
@@ -31,6 +31,7 @@ enum ConfirmAction {
     DeletePost,
     DeleteReply(i64),
     SetLocked(bool),
+    WithdrawProposal,
 }
 
 struct Editor {
@@ -38,8 +39,7 @@ struct Editor {
     board_slug: String,
     title: String,
     body: String,
-    options: String,
-    creates_poll: bool,
+    creates_proposal: bool,
     field: EditorField,
 }
 
@@ -49,11 +49,27 @@ enum EditorTarget {
     EditPost(i64),
     NewReply(i64),
     EditReply { id: i64 },
+    VetoProposal(i64),
+    ImplementProposal(i64),
 }
 
 impl EditorTarget {
     fn is_reply(&self) -> bool {
         matches!(self, Self::NewReply(_) | Self::EditReply { .. })
+    }
+
+    fn returns_to_view(&self) -> bool {
+        matches!(
+            self,
+            Self::NewReply(_)
+                | Self::EditReply { .. }
+                | Self::VetoProposal(_)
+                | Self::ImplementProposal(_)
+        )
+    }
+
+    fn is_note(&self) -> bool {
+        matches!(self, Self::VetoProposal(_) | Self::ImplementProposal(_))
     }
 }
 
@@ -61,7 +77,6 @@ impl EditorTarget {
 enum EditorField {
     Title,
     Body,
-    Options,
 }
 
 struct App {
@@ -173,6 +188,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                         ConfirmAction::DeletePost => app.delete_selected(),
                         ConfirmAction::DeleteReply(id) => app.delete_reply(id),
                         ConfirmAction::SetLocked(locked) => app.set_locked(locked),
+                        ConfirmAction::WithdrawProposal => app.withdraw_proposal(),
                     }
                 }
                 confirmation_destination(action)
@@ -182,7 +198,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         },
         Mode::Edit(mut editor) => {
             if key.code == KeyCode::Esc {
-                if editor.target.is_reply() {
+                if editor.target.returns_to_view() {
                     Mode::View
                 } else {
                     Mode::Browse
@@ -190,9 +206,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             } else if key.code == KeyCode::Char('s')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
             {
-                let is_reply = editor.target.is_reply();
+                let returns_to_view = editor.target.returns_to_view();
                 if app.save(&editor) {
-                    if is_reply { Mode::View } else { Mode::Browse }
+                    if returns_to_view {
+                        Mode::View
+                    } else {
+                        Mode::Browse
+                    }
                 } else {
                     Mode::Edit(editor)
                 }
@@ -220,22 +240,24 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> Mode {
                     board_slug: board.slug.clone(),
                     title: String::new(),
                     body: String::new(),
-                    options: String::new(),
-                    creates_poll: board.kind == BoardKind::Polls,
+                    creates_proposal: board.kind == BoardKind::Polls,
                     field: EditorField::Title,
                 });
             }
         }
         KeyCode::Char('e') => {
             if let Some(post) = app.load_selected() {
+                if post.proposal.is_some() {
+                    app.message = "Proposals cannot be edited after voting begins".to_owned();
+                    return Mode::Browse;
+                }
                 if post.author == app.handle {
                     return Mode::Edit(Editor {
                         target: EditorTarget::EditPost(post.id),
                         board_slug: post.board.slug,
                         title: post.title,
                         body: post.body,
-                        options: String::new(),
-                        creates_poll: false,
+                        creates_proposal: false,
                         field: EditorField::Title,
                     });
                 }
@@ -243,7 +265,12 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> Mode {
             }
         }
         KeyCode::Char('d') => {
-            if app.selected_post().is_some() {
+            if app
+                .selected_post()
+                .is_some_and(|post| post.proposal_state.is_some())
+            {
+                app.message = "Open a proposal and press w to withdraw it".to_owned();
+            } else if app.selected_post().is_some() {
                 return Mode::Confirm(ConfirmAction::DeletePost, false);
             }
         }
@@ -271,16 +298,24 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => Mode::Browse,
         KeyCode::Char('v') => {
-            if app.viewed.as_ref().is_some_and(|post| post.locked) {
-                app.message = "This proposal is locked".to_owned();
+            if let Some(proposal) = app.viewed.as_ref().and_then(|post| post.proposal.as_ref())
+                && proposal.state != ProposalState::Voting
+            {
+                app.message = format!(
+                    "Voting is closed; this proposal is {}",
+                    proposal.state.label()
+                );
                 return Mode::View;
             }
-            if app
-                .viewed
-                .as_ref()
-                .and_then(|post| post.poll.as_ref())
-                .is_some_and(|poll| !poll.options.is_empty())
-            {
+            if app.viewed.as_ref().is_some_and(|post| {
+                post.proposal
+                    .as_ref()
+                    .is_some_and(|proposal| proposal.state == ProposalState::Voting)
+                    && post
+                        .poll
+                        .as_ref()
+                        .is_some_and(|poll| !poll.options.is_empty())
+            }) {
                 Mode::Vote(0)
             } else {
                 app.message = "This post has no poll".to_owned();
@@ -291,13 +326,16 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
             if let Some(post) = &app.viewed
                 && post.author == app.handle
             {
+                if post.proposal.is_some() {
+                    app.message = "Proposals cannot be edited after voting begins".to_owned();
+                    return Mode::View;
+                }
                 Mode::Edit(Editor {
                     target: EditorTarget::EditPost(post.id),
                     board_slug: post.board.slug.clone(),
                     title: post.title.clone(),
                     body: post.body.clone(),
-                    options: String::new(),
-                    creates_poll: false,
+                    creates_proposal: false,
                     field: EditorField::Title,
                 })
             } else {
@@ -316,8 +354,7 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
                     board_slug: post.board.slug.clone(),
                     title: String::new(),
                     body: String::new(),
-                    options: String::new(),
-                    creates_poll: false,
+                    creates_proposal: false,
                     field: EditorField::Body,
                 });
             }
@@ -352,8 +389,7 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
                 board_slug: post.board.slug.clone(),
                 title: String::new(),
                 body: reply.body.clone(),
-                options: String::new(),
-                creates_poll: false,
+                creates_proposal: false,
                 field: EditorField::Body,
             })
         }
@@ -382,6 +418,48 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
             };
             Mode::Confirm(ConfirmAction::SetLocked(!post.locked), false)
         }
+        KeyCode::Char('w') => {
+            let Some(post) = &app.viewed else {
+                return Mode::View;
+            };
+            if post.author != app.handle
+                || post.proposal.as_ref().map(|proposal| proposal.state)
+                    != Some(ProposalState::Voting)
+            {
+                app.message =
+                    "Only the author may withdraw a proposal while voting is open".to_owned();
+                return Mode::View;
+            }
+            Mode::Confirm(ConfirmAction::WithdrawProposal, false)
+        }
+        KeyCode::Char('x') | KeyCode::Char('i') => {
+            if !app.groups.iter().any(|group| group == "wheel") {
+                app.message = "This proposal action requires Unix group wheel".to_owned();
+                return Mode::View;
+            }
+            let Some(post) = &app.viewed else {
+                return Mode::View;
+            };
+            if post.proposal.as_ref().map(|proposal| proposal.state)
+                != Some(ProposalState::Accepted)
+            {
+                app.message = "Only accepted proposals can be vetoed or implemented".to_owned();
+                return Mode::View;
+            }
+            let target = if key.code == KeyCode::Char('x') {
+                EditorTarget::VetoProposal(post.id)
+            } else {
+                EditorTarget::ImplementProposal(post.id)
+            };
+            Mode::Edit(Editor {
+                target,
+                board_slug: post.board.slug.clone(),
+                title: String::new(),
+                body: String::new(),
+                creates_proposal: false,
+                field: EditorField::Body,
+            })
+        }
         _ => Mode::View,
     }
 }
@@ -389,24 +467,24 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
 fn confirmation_destination(action: ConfirmAction) -> Mode {
     match action {
         ConfirmAction::DeletePost => Mode::Browse,
-        ConfirmAction::DeleteReply(_) | ConfirmAction::SetLocked(_) => Mode::View,
+        ConfirmAction::DeleteReply(_)
+        | ConfirmAction::SetLocked(_)
+        | ConfirmAction::WithdrawProposal => Mode::View,
     }
 }
 
 fn edit_key(editor: &mut Editor, key: KeyEvent) {
-    if editor.target.is_reply() && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+    if (editor.target.is_reply() || editor.target.is_note())
+        && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+    {
         return;
     }
     if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-        editor.field = match (editor.field, editor.creates_poll, key.code) {
-            (EditorField::Title, _, KeyCode::Tab) => EditorField::Body,
-            (EditorField::Body, true, KeyCode::Tab) => EditorField::Options,
-            (EditorField::Body, false, KeyCode::Tab) => EditorField::Title,
-            (EditorField::Options, _, KeyCode::Tab) => EditorField::Title,
-            (EditorField::Title, true, KeyCode::BackTab) => EditorField::Options,
-            (EditorField::Title, false, KeyCode::BackTab) => EditorField::Body,
-            (EditorField::Body, _, KeyCode::BackTab) => EditorField::Title,
-            (EditorField::Options, _, KeyCode::BackTab) => EditorField::Body,
+        editor.field = match (editor.field, key.code) {
+            (EditorField::Title, KeyCode::Tab) => EditorField::Body,
+            (EditorField::Body, KeyCode::Tab) => EditorField::Title,
+            (EditorField::Title, KeyCode::BackTab) => EditorField::Body,
+            (EditorField::Body, KeyCode::BackTab) => EditorField::Title,
             _ => editor.field,
         };
         return;
@@ -414,7 +492,6 @@ fn edit_key(editor: &mut Editor, key: KeyEvent) {
     let value = match editor.field {
         EditorField::Title => &mut editor.title,
         EditorField::Body => &mut editor.body,
-        EditorField::Options => &mut editor.options,
     };
     match key.code {
         KeyCode::Backspace => {
@@ -506,18 +583,14 @@ impl App {
             EditorTarget::EditPost(id) => self.client.update_post(id, &editor.title, &editor.body),
             EditorTarget::NewReply(post_id) => self.client.create_reply(post_id, &editor.body),
             EditorTarget::EditReply { id } => self.client.update_reply(id, &editor.body),
-            EditorTarget::NewPost if editor.creates_poll => self.client.create_poll(
-                &editor.board_slug,
-                &editor.title,
-                &editor.body,
-                editor
-                    .options
-                    .lines()
-                    .map(str::trim)
-                    .filter(|option| !option.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-            ),
+            EditorTarget::NewPost if editor.creates_proposal => {
+                self.client
+                    .create_proposal(&editor.board_slug, &editor.title, &editor.body)
+            }
+            EditorTarget::VetoProposal(id) => self.client.veto_proposal(id, &editor.body),
+            EditorTarget::ImplementProposal(id) => {
+                self.client.mark_proposal_implemented(id, &editor.body)
+            }
             EditorTarget::NewPost => {
                 self.client
                     .create_post(&editor.board_slug, &editor.title, &editor.body)
@@ -527,13 +600,15 @@ impl App {
             Ok(post) => {
                 self.message = match editor.target {
                     EditorTarget::EditPost(_) => "Post updated",
-                    EditorTarget::NewPost if editor.creates_poll => "Proposal created",
+                    EditorTarget::NewPost if editor.creates_proposal => "Proposal created",
                     EditorTarget::NewPost => "Post created",
                     EditorTarget::NewReply(_) => "Reply posted",
                     EditorTarget::EditReply { .. } => "Reply updated",
+                    EditorTarget::VetoProposal(_) => "Proposal vetoed",
+                    EditorTarget::ImplementProposal(_) => "Proposal marked implemented",
                 }
                 .to_owned();
-                if editor.target.is_reply() {
+                if editor.target.returns_to_view() {
                     self.viewed = Some(post);
                 } else {
                     self.refresh();
@@ -575,6 +650,17 @@ impl App {
                 }
                 .to_owned();
                 self.viewed = Some(post);
+            }
+            Err(error) => self.message = error.to_string(),
+        }
+    }
+
+    fn withdraw_proposal(&mut self) {
+        let Some(post) = &self.viewed else { return };
+        match self.client.withdraw_proposal(post.id) {
+            Ok(post) => {
+                self.viewed = Some(post);
+                self.message = "Proposal withdrawn".to_owned();
             }
             Err(error) => self.message = error.to_string(),
         }

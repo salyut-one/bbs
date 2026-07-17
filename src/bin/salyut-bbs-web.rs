@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use salyut_bbs::{
     client::Client,
-    protocol::{Board, Post, PostSummary},
+    protocol::{Board, Post, PostSummary, ProposalState},
 };
 use tiny_http::{Header, Request as HttpRequest, Response as HttpResponse, Server, StatusCode};
 
@@ -171,13 +171,18 @@ fn render_board(client: &Client, slug: &str) -> Result<Option<String>> {
 
 fn post_row(post: &PostSummary) -> String {
     let poll = if post.is_poll { " ◉" } else { "" };
+    let proposal = post
+        .proposal_state
+        .map(|state| format!(" [{}]", state.label()))
+        .unwrap_or_default();
     let locked = if post.locked { " [locked]" } else { "" };
     format!(
-        "<li><a href=\"/posts/{id}\">{title}{poll}</a>{locked} — \
+        "<li><a href=\"/posts/{id}\">{title}{poll}</a>{proposal}{locked} — \
          <span>@{author}, {date}, #{id} · {reply_count} repl{reply_suffix}</span></li>",
         id = post.id,
         title = escape(&post.title),
         poll = poll,
+        proposal = proposal,
         locked = locked,
         author = escape(&post.author),
         date = post.updated_at.format("%Y-%m-%d"),
@@ -199,6 +204,58 @@ fn post_html(post: &Post) -> String {
     } else {
         ""
     };
+    let proposal = post.proposal.as_ref().map_or_else(String::new, |proposal| {
+        let timing = if proposal.state == ProposalState::Voting {
+            format!(
+                "<p>Voting closes {}.</p>",
+                proposal.closes_at.format("%Y-%m-%d %H:%M UTC")
+            )
+        } else {
+            proposal.closed_at.map_or_else(String::new, |closed_at| {
+                format!(
+                    "<p>Voting closed {}.</p>",
+                    closed_at.format("%Y-%m-%d %H:%M UTC")
+                )
+            })
+        };
+        let history = proposal
+            .events
+            .iter()
+            .map(|event| {
+                let actor = event.actor.as_ref().map_or_else(
+                    || "system".to_owned(),
+                    |actor| {
+                        event.actor_uid.map_or_else(
+                            || format!("@{actor}"),
+                            |uid| format!("@{actor} (uid {uid})"),
+                        )
+                    },
+                );
+                let transition = event.from_state.map_or_else(
+                    || event.to_state.label().to_owned(),
+                    |from| format!("{} → {}", from.label(), event.to_state.label()),
+                );
+                let reason = event
+                    .reason
+                    .as_ref()
+                    .map(|reason| format!(" — {}", escape(reason)))
+                    .unwrap_or_default();
+                format!(
+                    "<li>{date} · {transition} · {actor}{reason}</li>",
+                    date = event.created_at.format("%Y-%m-%d %H:%M UTC"),
+                    transition = escape(&transition),
+                    actor = escape(&actor),
+                    reason = reason,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        format!(
+            "<section class=\"proposal\"><hr><h2>Proposal: {state}</h2>{timing}\
+             <h3>History</h3><ol>{history}</ol></section>",
+            state = escape(proposal.state.label()),
+        )
+    });
     let poll = post.poll.as_ref().map_or_else(String::new, |poll| {
         let options = poll
             .options
@@ -220,10 +277,14 @@ fn post_html(post: &Post) -> String {
             })
             .collect::<Vec<_>>()
             .join("");
-        let voting = if post.locked {
-            "Voting is closed."
-        } else {
+        let voting = if post
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.state == ProposalState::Voting)
+        {
             "Log in through the terminal to vote."
+        } else {
+            "Voting is closed."
         };
         format!(
             "<section class=\"poll\"><hr><h2>Poll results</h2><ul>{options}</ul>\
@@ -260,7 +321,7 @@ fn post_html(post: &Post) -> String {
     format!(
         "<h1>{title}</h1>{locked}<p class=\"byline\">\
          Posted by @{author} in {board_name} on {date} · #{id}</p>\
-         <hr><pre>{body}</pre>{poll}<section class=\"replies\"><hr>\
+         <hr><pre>{body}</pre>{proposal}{poll}<section class=\"replies\"><hr>\
          <h2>Replies</h2>{replies}{reply_status}</section>",
         locked = locked,
         board_name = escape(&post.board.name),
@@ -269,6 +330,7 @@ fn post_html(post: &Post) -> String {
         author = escape(&post.author),
         date = post.updated_at.format("%Y-%m-%d %H:%M UTC"),
         body = escape(&post.body),
+        proposal = proposal,
         poll = poll,
         replies = replies,
         reply_status = reply_status,
@@ -316,7 +378,7 @@ const CSS: &str = include_str!("../../assets/web.css");
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use salyut_bbs::protocol::{Board, BoardKind, Post};
+    use salyut_bbs::protocol::{Board, BoardKind, Post, Proposal, ProposalEvent, ProposalState};
 
     use super::{escape, page, post_html};
 
@@ -347,6 +409,7 @@ mod tests {
             locked: false,
             replies: Vec::new(),
             poll: None,
+            proposal: None,
             created_at: now,
             updated_at: now,
         };
@@ -360,5 +423,50 @@ mod tests {
         let html = page("Title", "<p>Body</p>");
         assert!(html.contains("href=\"https://salyut.one/users\">[User List]</a>"));
         assert!(!html.contains("Service Status"));
+    }
+
+    #[test]
+    fn proposal_page_renders_state_deadline_and_escaped_history() {
+        let now = Utc::now();
+        let post = Post {
+            id: 3,
+            board: Board {
+                id: 3,
+                slug: "proposals".to_owned(),
+                name: "Proposals".to_owned(),
+                description: String::new(),
+                kind: BoardKind::Polls,
+                write_group: None,
+            },
+            author: "alice".to_owned(),
+            title: "Add tea".to_owned(),
+            body: "Tea for everyone.".to_owned(),
+            locked: false,
+            replies: Vec::new(),
+            poll: None,
+            proposal: Some(Proposal {
+                state: ProposalState::Vetoed,
+                opens_at: now,
+                closes_at: now,
+                closed_at: Some(now),
+                events: vec![ProposalEvent {
+                    id: 1,
+                    from_state: Some(ProposalState::Accepted),
+                    to_state: ProposalState::Vetoed,
+                    actor_uid: Some(0),
+                    actor: Some("root".to_owned()),
+                    reason: Some("<unsafe>".to_owned()),
+                    created_at: now,
+                }],
+            }),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let html = post_html(&post);
+        assert!(html.contains("Proposal: vetoed"));
+        assert!(html.contains("@root (uid 0)"));
+        assert!(html.contains("&lt;unsafe&gt;"));
+        assert!(!html.contains("<unsafe>"));
     }
 }

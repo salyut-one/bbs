@@ -1,15 +1,17 @@
-use std::collections::HashSet;
-
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::protocol::{Board, BoardKind, Poll, PollOption, Post, PostSummary, Reply};
+use crate::protocol::{
+    Board, BoardKind, Poll, PollOption, Post, PostSummary, Proposal, ProposalEvent, ProposalState,
+    Reply,
+};
 
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_BODY_BYTES: usize = 64 * 1024;
-const MAX_POLL_OPTIONS: usize = 10;
-const MAX_OPTION_CHARS: usize = 80;
+const MAX_TRANSITION_NOTE_BYTES: usize = 4 * 1024;
+pub const PROPOSAL_VOTING_DAYS: i64 = 7;
+const PROPOSAL_OPTIONS: [&str; 3] = ["For", "Against", "Abstain"];
 
 pub struct Database {
     connection: Connection,
@@ -17,7 +19,7 @@ pub struct Database {
 
 impl Database {
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        let connection =
+        let mut connection =
             Connection::open(path).with_context(|| format!("open database {}", path.display()))?;
         connection
             .execute_batch(
@@ -41,7 +43,7 @@ impl Database {
                      (2, 'updates', 'Updates',
                       'Service notices and maintenance updates.', 'discussion', 'wheel'),
                      (3, 'proposals', 'Proposals',
-                      'Polls about changes to salyut.one.', 'polls', NULL)
+                      'Seven-day votes about changes to salyut.one.', 'polls', NULL)
                  ON CONFLICT(id) DO UPDATE SET
                      slug = excluded.slug,
                      name = excluded.name,
@@ -115,9 +117,39 @@ impl Database {
                  );
 
                  CREATE INDEX IF NOT EXISTS replies_post_created_at
-                     ON replies(post_id, created_at, id);",
+                     ON replies(post_id, created_at, id);
+
+                 CREATE TABLE IF NOT EXISTS proposals (
+                     post_id     INTEGER PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE,
+                     state       TEXT NOT NULL CHECK (state IN (
+                         'voting', 'accepted', 'rejected', 'withdrawn',
+                         'vetoed', 'implemented'
+                     )),
+                     opens_at    TEXT NOT NULL,
+                     closes_at   TEXT NOT NULL,
+                     closed_at   TEXT
+                 );
+
+                 CREATE INDEX IF NOT EXISTS proposals_due
+                     ON proposals(state, closes_at);
+
+                 CREATE TABLE IF NOT EXISTS proposal_events (
+                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     post_id     INTEGER NOT NULL REFERENCES proposals(post_id) ON DELETE CASCADE,
+                     from_state  TEXT,
+                     to_state    TEXT NOT NULL,
+                     actor_uid   INTEGER,
+                     actor       TEXT,
+                     reason      TEXT,
+                     created_at  TEXT NOT NULL
+                 );
+
+                 CREATE INDEX IF NOT EXISTS proposal_events_post
+                     ON proposal_events(post_id, created_at, id);",
             )
-            .context("initialize poll and reply schema")?;
+            .context("initialize poll, reply, and proposal schema")?;
+
+        migrate_legacy_proposals(&mut connection)?;
 
         Ok(Self { connection })
     }
@@ -157,11 +189,12 @@ impl Database {
         let mut statement = self.connection.prepare(
             "SELECT p.id, b.slug, p.author, p.title,
                     EXISTS(SELECT 1 FROM poll_options po WHERE po.post_id = p.id),
-                    p.locked,
+                    pr.state, p.locked,
                     (SELECT COUNT(*) FROM replies r WHERE r.post_id = p.id),
                     p.created_at, p.updated_at
              FROM posts p
              JOIN boards b ON b.id = p.board_id
+             LEFT JOIN proposals pr ON pr.post_id = p.id
              WHERE p.board_id = ?1
              ORDER BY p.updated_at DESC, p.id DESC
              LIMIT ?2 OFFSET ?3",
@@ -173,10 +206,14 @@ impl Database {
                 author: row.get(2)?,
                 title: row.get(3)?,
                 is_poll: row.get(4)?,
-                locked: row.get(5)?,
-                reply_count: row.get(6)?,
-                created_at: parse_timestamp(row.get::<_, String>(7)?)?,
-                updated_at: parse_timestamp(row.get::<_, String>(8)?)?,
+                proposal_state: row
+                    .get::<_, Option<String>>(5)?
+                    .map(parse_proposal_state)
+                    .transpose()?,
+                locked: row.get(6)?,
+                reply_count: row.get(7)?,
+                created_at: parse_timestamp(row.get::<_, String>(8)?)?,
+                updated_at: parse_timestamp(row.get::<_, String>(9)?)?,
             })
         })?;
         Ok(Some(
@@ -205,6 +242,7 @@ impl Database {
         };
         if post.board.kind == BoardKind::Polls {
             post.poll = Some(self.poll(id, viewer_uid)?);
+            post.proposal = self.proposal(id)?;
         }
         post.replies = self.replies(id)?;
         Ok(Some(post))
@@ -232,18 +270,18 @@ impl Database {
         self.get(id, uid)?.context("newly created post disappeared")
     }
 
-    pub fn create_poll(
+    pub fn create_proposal(
         &mut self,
         board: &Board,
         uid: u32,
         author: &str,
         title: &str,
         body: &str,
-        options: &[String],
     ) -> Result<Post> {
         validate_post(title, body)?;
-        validate_poll_options(options)?;
-        let timestamp = Utc::now().to_rfc3339();
+        let opened_at = Utc::now();
+        let timestamp = opened_at.to_rfc3339();
+        let closes_at = (opened_at + Duration::days(PROPOSAL_VOTING_DAYS)).to_rfc3339();
         let transaction = self.connection.transaction()?;
         transaction.execute(
             "INSERT INTO posts
@@ -257,12 +295,24 @@ impl Database {
                 "INSERT INTO poll_options (post_id, label, position)
                  VALUES (?1, ?2, ?3)",
             )?;
-            for (position, option) in options.iter().enumerate() {
-                statement.execute(params![id, option.trim(), position as i64])?;
+            for (position, option) in PROPOSAL_OPTIONS.iter().enumerate() {
+                statement.execute(params![id, option, position as i64])?;
             }
         }
+        transaction.execute(
+            "INSERT INTO proposals (post_id, state, opens_at, closes_at)
+             VALUES (?1, 'voting', ?2, ?3)",
+            params![id, timestamp, closes_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO proposal_events
+                 (post_id, from_state, to_state, actor_uid, actor, created_at)
+             VALUES (?1, NULL, 'voting', ?2, ?3, ?4)",
+            params![id, uid, author, timestamp],
+        )?;
         transaction.commit()?;
-        self.get(id, uid)?.context("newly created poll disappeared")
+        self.get(id, uid)?
+            .context("newly created proposal disappeared")
     }
 
     pub fn update(&mut self, uid: u32, id: i64, title: &str, body: &str) -> Result<Option<Post>> {
@@ -286,6 +336,7 @@ impl Database {
     }
 
     pub fn vote(&mut self, uid: u32, post_id: i64, option_id: i64) -> Result<Option<Post>> {
+        let timestamp = Utc::now().to_rfc3339();
         let transaction = self.connection.transaction()?;
         let valid: bool = transaction.query_row(
             "SELECT EXISTS(
@@ -294,9 +345,14 @@ impl Database {
                  JOIN posts p ON p.id = po.post_id
                  JOIN boards b ON b.id = p.board_id
                  WHERE po.id = ?1 AND po.post_id = ?2
-                   AND b.kind = 'polls' AND p.locked = 0
+                   AND b.kind = 'polls'
+                   AND EXISTS (
+                       SELECT 1 FROM proposals pr
+                       WHERE pr.post_id = p.id AND pr.state = 'voting'
+                         AND pr.closes_at > ?3
+                   )
              )",
-            params![option_id, post_id],
+            params![option_id, post_id, timestamp],
             |row| row.get(0),
         )?;
         if !valid {
@@ -308,7 +364,7 @@ impl Database {
              ON CONFLICT(post_id, voter_uid) DO UPDATE SET
                  option_id = excluded.option_id,
                  voted_at = excluded.voted_at",
-            params![post_id, option_id, uid, Utc::now().to_rfc3339()],
+            params![post_id, option_id, uid, timestamp],
         )?;
         transaction.commit()?;
         self.get(post_id, uid)
@@ -384,6 +440,107 @@ impl Database {
         self.get(id, viewer_uid)
     }
 
+    pub fn finalize_due_proposals(&mut self, now: DateTime<Utc>) -> Result<usize> {
+        let due = {
+            let mut statement = self.connection.prepare(
+                "SELECT post_id FROM proposals
+                 WHERE state = 'voting' AND closes_at <= ?1
+                 ORDER BY post_id",
+            )?;
+            statement
+                .query_map([now.to_rfc3339()], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut finalized = 0;
+        for post_id in due {
+            let (for_votes, against_votes, _) = self.proposal_tally(post_id)?;
+            let state = if for_votes > against_votes {
+                ProposalState::Accepted
+            } else {
+                ProposalState::Rejected
+            };
+            if self.transition_proposal(
+                post_id,
+                ProposalState::Voting,
+                state,
+                None,
+                None,
+                None,
+                now,
+            )? {
+                finalized += 1;
+            }
+        }
+        Ok(finalized)
+    }
+
+    pub fn withdraw_proposal(
+        &mut self,
+        post_id: i64,
+        uid: u32,
+        actor: &str,
+    ) -> Result<Option<Post>> {
+        let now = Utc::now();
+        if !self.transition_proposal(
+            post_id,
+            ProposalState::Voting,
+            ProposalState::Withdrawn,
+            Some(uid),
+            Some(actor),
+            None,
+            now,
+        )? {
+            return Ok(None);
+        }
+        self.get(post_id, uid)
+    }
+
+    pub fn veto_proposal(
+        &mut self,
+        post_id: i64,
+        uid: u32,
+        actor: &str,
+        reason: &str,
+    ) -> Result<Option<Post>> {
+        validate_transition_note("veto reason", reason)?;
+        let now = Utc::now();
+        if !self.transition_proposal(
+            post_id,
+            ProposalState::Accepted,
+            ProposalState::Vetoed,
+            Some(uid),
+            Some(actor),
+            Some(reason.trim()),
+            now,
+        )? {
+            return Ok(None);
+        }
+        self.get(post_id, uid)
+    }
+
+    pub fn mark_proposal_implemented(
+        &mut self,
+        post_id: i64,
+        uid: u32,
+        actor: &str,
+        note: &str,
+    ) -> Result<Option<Post>> {
+        validate_transition_note("implementation note", note)?;
+        let now = Utc::now();
+        if !self.transition_proposal(
+            post_id,
+            ProposalState::Accepted,
+            ProposalState::Implemented,
+            Some(uid),
+            Some(actor),
+            Some(note.trim()),
+            now,
+        )? {
+            return Ok(None);
+        }
+        self.get(post_id, uid)
+    }
+
     pub fn owner_uid(&self, id: i64) -> Result<Option<u32>> {
         self.connection
             .query_row("SELECT author_uid FROM posts WHERE id = ?1", [id], |row| {
@@ -426,6 +583,129 @@ impl Database {
             total_votes,
             my_vote,
         })
+    }
+
+    fn proposal(&self, post_id: i64) -> Result<Option<Proposal>> {
+        let Some((state, opens_at, closes_at, closed_at)) = self
+            .connection
+            .query_row(
+                "SELECT state, opens_at, closes_at, closed_at
+                 FROM proposals WHERE post_id = ?1",
+                [post_id],
+                |row| {
+                    Ok((
+                        parse_proposal_state(row.get(0)?)?,
+                        parse_timestamp(row.get(1)?)?,
+                        parse_timestamp(row.get(2)?)?,
+                        row.get::<_, Option<String>>(3)?
+                            .map(parse_timestamp)
+                            .transpose()?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT id, from_state, to_state, actor_uid, actor, reason, created_at
+             FROM proposal_events
+             WHERE post_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let events = statement
+            .query_map([post_id], |row| {
+                Ok(ProposalEvent {
+                    id: row.get(0)?,
+                    from_state: row
+                        .get::<_, Option<String>>(1)?
+                        .map(parse_proposal_state)
+                        .transpose()?,
+                    to_state: parse_proposal_state(row.get(2)?)?,
+                    actor_uid: row.get(3)?,
+                    actor: row.get(4)?,
+                    reason: row.get(5)?,
+                    created_at: parse_timestamp(row.get(6)?)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(Proposal {
+            state,
+            opens_at,
+            closes_at,
+            closed_at,
+            events,
+        }))
+    }
+
+    fn proposal_tally(&self, post_id: i64) -> Result<(u32, u32, u32)> {
+        let mut statement = self.connection.prepare(
+            "SELECT po.position, COUNT(pv.voter_uid)
+             FROM poll_options po
+             LEFT JOIN poll_votes pv ON pv.option_id = po.id
+             WHERE po.post_id = ?1
+             GROUP BY po.id, po.position
+             ORDER BY po.position",
+        )?;
+        let mut tally = [0_u32; 3];
+        for row in statement.query_map([post_id], |row| {
+            Ok((row.get::<_, usize>(0)?, row.get::<_, u32>(1)?))
+        })? {
+            let (position, votes) = row?;
+            if position < 2 {
+                tally[position] = tally[position].saturating_add(votes);
+            } else {
+                tally[2] = tally[2].saturating_add(votes);
+            }
+        }
+        Ok((tally[0], tally[1], tally[2]))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transition_proposal(
+        &mut self,
+        post_id: i64,
+        from: ProposalState,
+        to: ProposalState,
+        actor_uid: Option<u32>,
+        actor: Option<&str>,
+        reason: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let timestamp = now.to_rfc3339();
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE proposals
+             SET state = ?1, closed_at = CASE
+                 WHEN ?1 IN ('accepted', 'rejected', 'withdrawn') THEN ?2
+                 ELSE closed_at
+             END
+             WHERE post_id = ?3 AND state = ?4",
+            params![to.label(), timestamp, post_id, from.label()],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        transaction.execute(
+            "UPDATE posts SET updated_at = ?1 WHERE id = ?2",
+            params![timestamp, post_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO proposal_events
+                 (post_id, from_state, to_state, actor_uid, actor, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                post_id,
+                from.label(),
+                to.label(),
+                actor_uid,
+                actor,
+                reason,
+                timestamp
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     fn replies(&self, post_id: i64) -> Result<Vec<Reply>> {
@@ -488,22 +768,12 @@ fn validate_body(body: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_poll_options(options: &[String]) -> Result<()> {
-    if !(2..=MAX_POLL_OPTIONS).contains(&options.len()) {
-        bail!("a poll must have between 2 and {MAX_POLL_OPTIONS} options");
+fn validate_transition_note(name: &str, note: &str) -> Result<()> {
+    if note.trim().is_empty() {
+        bail!("{name} cannot be empty");
     }
-    let mut unique = HashSet::new();
-    for option in options {
-        let option = option.trim();
-        if option.is_empty() {
-            bail!("poll options cannot be empty");
-        }
-        if option.chars().count() > MAX_OPTION_CHARS {
-            bail!("poll options cannot exceed {MAX_OPTION_CHARS} characters");
-        }
-        if !unique.insert(option.to_lowercase()) {
-            bail!("poll options must be unique");
-        }
+    if note.len() > MAX_TRANSITION_NOTE_BYTES {
+        bail!("{name} cannot exceed {MAX_TRANSITION_NOTE_BYTES} bytes");
     }
     Ok(())
 }
@@ -530,6 +800,25 @@ fn parse_board_kind(value: String) -> rusqlite::Result<BoardKind> {
             format!("unknown board kind {value}").into(),
         )),
     }
+}
+
+fn parse_proposal_state(value: String) -> rusqlite::Result<ProposalState> {
+    let state = match value.as_str() {
+        "voting" => ProposalState::Voting,
+        "accepted" => ProposalState::Accepted,
+        "rejected" => ProposalState::Rejected,
+        "withdrawn" => ProposalState::Withdrawn,
+        "vetoed" => ProposalState::Vetoed,
+        "implemented" => ProposalState::Implemented,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                value.len(),
+                rusqlite::types::Type::Text,
+                format!("unknown proposal state {value}").into(),
+            ));
+        }
+    };
+    Ok(state)
 }
 
 fn board_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Board> {
@@ -560,9 +849,92 @@ fn post_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Post> {
         locked: row.get(10)?,
         replies: Vec::new(),
         poll: None,
+        proposal: None,
         created_at: parse_timestamp(row.get::<_, String>(11)?)?,
         updated_at: parse_timestamp(row.get::<_, String>(12)?)?,
     })
+}
+
+fn migrate_legacy_proposals(connection: &mut Connection) -> Result<()> {
+    let legacy = {
+        let mut statement = connection.prepare(
+            "SELECT p.id, p.author_uid, p.author, p.created_at, p.updated_at, p.locked
+             FROM posts p
+             JOIN boards b ON b.id = p.board_id
+             WHERE b.kind = 'polls'
+               AND EXISTS (SELECT 1 FROM poll_options po WHERE po.post_id = p.id)
+               AND NOT EXISTS (SELECT 1 FROM proposals pr WHERE pr.post_id = p.id)
+             ORDER BY p.id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (post_id, author_uid, author, created_at, updated_at, locked) in legacy {
+        let opened_at = DateTime::parse_from_rfc3339(&created_at)
+            .with_context(|| format!("parse legacy proposal #{post_id} creation time"))?
+            .with_timezone(&Utc);
+        let closes_at = opened_at + Duration::days(PROPOSAL_VOTING_DAYS);
+        let (state, closed_at) = if locked {
+            let (for_votes, against_votes): (u32, u32) = connection.query_row(
+                "SELECT
+                     COALESCE(SUM(CASE WHEN po.position = 0 THEN 1 ELSE 0 END), 0),
+                     COALESCE(SUM(CASE WHEN po.position = 1 THEN 1 ELSE 0 END), 0)
+                 FROM poll_votes pv
+                 JOIN poll_options po ON po.id = pv.option_id
+                 WHERE pv.post_id = ?1",
+                [post_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            (
+                if for_votes > against_votes {
+                    ProposalState::Accepted
+                } else {
+                    ProposalState::Rejected
+                },
+                Some(updated_at.clone()),
+            )
+        } else {
+            (ProposalState::Voting, None)
+        };
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO proposals
+                 (post_id, state, opens_at, closes_at, closed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                post_id,
+                state.label(),
+                created_at,
+                closes_at.to_rfc3339(),
+                closed_at
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO proposal_events
+                 (post_id, from_state, to_state, actor_uid, actor, reason, created_at)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                post_id,
+                state.label(),
+                author_uid,
+                author,
+                "Migrated from the legacy poll lifecycle",
+                updated_at
+            ],
+        )?;
+        transaction.commit()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -573,7 +945,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::Database;
+    use super::{Database, PROPOSAL_VOTING_DAYS};
+    use crate::protocol::ProposalState;
+    use chrono::Duration;
     use rusqlite::Connection;
 
     #[test]
@@ -619,20 +993,20 @@ mod tests {
     }
 
     #[test]
-    fn poll_accepts_one_changeable_vote_per_uid() {
+    fn proposal_accepts_one_changeable_vote_per_uid() {
         let mut database = Database::open(Path::new(":memory:")).unwrap();
         let board = database.board("proposals").unwrap().unwrap();
         let poll = database
-            .create_poll(
-                &board,
-                1001,
-                "alice",
-                "Tea?",
-                "Choose a tea.",
-                &["Earl Grey".to_owned(), "Assam".to_owned()],
-            )
+            .create_proposal(&board, 1001, "alice", "Tea?", "Serve tea?")
             .unwrap();
         let options = &poll.poll.as_ref().unwrap().options;
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            ["For", "Against", "Abstain"]
+        );
         let first = options[0].id;
         let second = options[1].id;
 
@@ -693,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn locked_posts_reject_new_replies_and_votes() {
+    fn locking_closes_replies_but_does_not_close_proposal_voting() {
         let mut database = Database::open(Path::new(":memory:")).unwrap();
         let general = database.board("general").unwrap().unwrap();
         let post = database
@@ -710,14 +1084,7 @@ mod tests {
 
         let proposals = database.board("proposals").unwrap().unwrap();
         let proposal = database
-            .create_poll(
-                &proposals,
-                1001,
-                "alice",
-                "Tea?",
-                "Choose a tea.",
-                &["Earl Grey".to_owned(), "Assam".to_owned()],
-            )
+            .create_proposal(&proposals, 1001, "alice", "Tea?", "Serve tea?")
             .unwrap();
         let option_id = proposal.poll.as_ref().unwrap().options[0].id;
         database
@@ -728,26 +1095,130 @@ mod tests {
             database
                 .vote(1002, proposal.id, option_id)
                 .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn proposals_close_after_seven_days_and_abstentions_do_not_affect_outcome() {
+        let mut database = Database::open(Path::new(":memory:")).unwrap();
+        let board = database.board("proposals").unwrap().unwrap();
+        let proposal = database
+            .create_proposal(&board, 1001, "alice", "Tea?", "Serve tea?")
+            .unwrap();
+        let lifecycle = proposal.proposal.as_ref().unwrap();
+        assert_eq!(
+            lifecycle.closes_at - lifecycle.opens_at,
+            Duration::days(PROPOSAL_VOTING_DAYS)
+        );
+        let options = &proposal.poll.as_ref().unwrap().options;
+        database.vote(1001, proposal.id, options[0].id).unwrap();
+        database.vote(1002, proposal.id, options[0].id).unwrap();
+        database.vote(1003, proposal.id, options[1].id).unwrap();
+        database.vote(1004, proposal.id, options[2].id).unwrap();
+        database.vote(1005, proposal.id, options[2].id).unwrap();
+
+        assert_eq!(
+            database
+                .finalize_due_proposals(lifecycle.closes_at)
+                .unwrap(),
+            1
+        );
+        let closed = database.get(proposal.id, 1001).unwrap().unwrap();
+        assert_eq!(
+            closed.proposal.as_ref().unwrap().state,
+            ProposalState::Accepted
+        );
+        assert!(
+            database
+                .vote(1006, proposal.id, options[0].id)
+                .unwrap()
                 .is_none()
         );
     }
 
     #[test]
-    fn validation_rejects_bad_polls() {
+    fn tied_proposal_is_rejected() {
         let mut database = Database::open(Path::new(":memory:")).unwrap();
         let board = database.board("proposals").unwrap().unwrap();
-        assert!(
+        let proposal = database
+            .create_proposal(&board, 1001, "alice", "Tea?", "Serve tea?")
+            .unwrap();
+        let options = &proposal.poll.as_ref().unwrap().options;
+        database.vote(1001, proposal.id, options[0].id).unwrap();
+        database.vote(1002, proposal.id, options[1].id).unwrap();
+        let closes_at = proposal.proposal.as_ref().unwrap().closes_at;
+        database.finalize_due_proposals(closes_at).unwrap();
+        assert_eq!(
             database
-                .create_poll(
-                    &board,
-                    1001,
-                    "alice",
-                    "Title",
-                    "Body",
-                    &["same".to_owned(), "Same".to_owned()],
-                )
-                .is_err()
+                .get(proposal.id, 1001)
+                .unwrap()
+                .unwrap()
+                .proposal
+                .unwrap()
+                .state,
+            ProposalState::Rejected
         );
+    }
+
+    #[test]
+    fn accepted_proposal_can_be_vetoed_or_implemented_with_an_audit_note() {
+        for implemented in [false, true] {
+            let mut database = Database::open(Path::new(":memory:")).unwrap();
+            let board = database.board("proposals").unwrap().unwrap();
+            let proposal = database
+                .create_proposal(&board, 1001, "alice", "Tea?", "Serve tea?")
+                .unwrap();
+            let option = proposal.poll.as_ref().unwrap().options[0].id;
+            database.vote(1001, proposal.id, option).unwrap();
+            let closes_at = proposal.proposal.as_ref().unwrap().closes_at;
+            database.finalize_due_proposals(closes_at).unwrap();
+            let changed = if implemented {
+                database
+                    .mark_proposal_implemented(proposal.id, 0, "root", "Installed the kettle.")
+                    .unwrap()
+            } else {
+                database
+                    .veto_proposal(proposal.id, 0, "root", "Exceeds the power budget.")
+                    .unwrap()
+            }
+            .unwrap();
+            let lifecycle = changed.proposal.unwrap();
+            assert_eq!(
+                lifecycle.state,
+                if implemented {
+                    ProposalState::Implemented
+                } else {
+                    ProposalState::Vetoed
+                }
+            );
+            assert_eq!(
+                lifecycle
+                    .events
+                    .iter()
+                    .find(|event| event.to_state == lifecycle.state)
+                    .and_then(|event| event.reason.as_deref()),
+                Some(if implemented {
+                    "Installed the kettle."
+                } else {
+                    "Exceeds the power budget."
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_author_can_withdraw_while_voting_is_open() {
+        let mut database = Database::open(Path::new(":memory:")).unwrap();
+        let board = database.board("proposals").unwrap().unwrap();
+        let proposal = database
+            .create_proposal(&board, 1001, "alice", "Tea?", "Serve tea?")
+            .unwrap();
+        let withdrawn = database
+            .withdraw_proposal(proposal.id, 1001, "alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!(withdrawn.proposal.unwrap().state, ProposalState::Withdrawn);
     }
 
     #[test]
@@ -791,6 +1262,91 @@ mod tests {
                 "general"
             );
             assert!(!database.get(posts[0].id, 1001).unwrap().unwrap().locked);
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn migrates_locked_legacy_proposal_without_losing_votes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "salyut-bbs-proposal-migration-{}-{nonce}.sqlite3",
+            std::process::id()
+        ));
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE boards (
+                         id INTEGER PRIMARY KEY,
+                         slug TEXT NOT NULL UNIQUE,
+                         name TEXT NOT NULL,
+                         description TEXT NOT NULL,
+                         kind TEXT NOT NULL,
+                         write_group TEXT
+                     );
+                     INSERT INTO boards VALUES
+                         (3, 'proposals', 'Proposals', 'Legacy polls', 'polls', NULL);
+                     CREATE TABLE posts (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         board_id INTEGER NOT NULL,
+                         author_uid INTEGER NOT NULL,
+                         author TEXT NOT NULL,
+                         title TEXT NOT NULL,
+                         body TEXT NOT NULL,
+                         locked INTEGER NOT NULL DEFAULT 0,
+                         created_at TEXT NOT NULL,
+                         updated_at TEXT NOT NULL
+                     );
+                     INSERT INTO posts VALUES
+                         (1, 3, 1001, 'alice', 'Legacy proposal', 'Keep this',
+                          1, '2026-07-01T00:00:00Z', '2026-07-08T00:00:00Z');
+                     CREATE TABLE poll_options (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         post_id INTEGER NOT NULL,
+                         label TEXT NOT NULL,
+                         position INTEGER NOT NULL,
+                         UNIQUE(post_id, position)
+                     );
+                     INSERT INTO poll_options VALUES
+                         (1, 1, 'yes', 0),
+                         (2, 1, 'no', 1);
+                     CREATE TABLE poll_votes (
+                         post_id INTEGER NOT NULL,
+                         option_id INTEGER NOT NULL,
+                         voter_uid INTEGER NOT NULL,
+                         voted_at TEXT NOT NULL,
+                         PRIMARY KEY(post_id, voter_uid)
+                     );
+                     INSERT INTO poll_votes VALUES
+                         (1, 1, 1001, '2026-07-02T00:00:00Z'),
+                         (1, 1, 1002, '2026-07-02T00:00:00Z'),
+                         (1, 2, 1003, '2026-07-02T00:00:00Z');",
+                )
+                .unwrap();
+        }
+        {
+            let database = Database::open(&path).unwrap();
+            let proposal = database.get(1, 1001).unwrap().unwrap();
+            assert_eq!(
+                proposal.proposal.as_ref().unwrap().state,
+                ProposalState::Accepted
+            );
+            assert_eq!(proposal.poll.as_ref().unwrap().total_votes, 3);
+            assert_eq!(
+                proposal
+                    .proposal
+                    .unwrap()
+                    .events
+                    .first()
+                    .unwrap()
+                    .reason
+                    .as_deref(),
+                Some("Migrated from the legacy poll lifecycle")
+            );
         }
         fs::remove_file(path).unwrap();
     }

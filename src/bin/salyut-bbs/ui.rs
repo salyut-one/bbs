@@ -105,6 +105,10 @@ fn draw_post_list(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
 }
 
 fn post_item(post: &salyut_bbs::protocol::PostSummary) -> ListItem<'_> {
+    let proposal = post
+        .proposal_state
+        .map(|state| format!(" [{}]", state.label()))
+        .unwrap_or_default();
     ListItem::new(Line::from(vec![
         Span::styled(
             format!("{:>4} ", post.id),
@@ -112,9 +116,10 @@ fn post_item(post: &salyut_bbs::protocol::PostSummary) -> ListItem<'_> {
         ),
         Span::styled(
             format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 post.title,
                 if post.is_poll { " ◉" } else { "" },
+                proposal,
                 if post.locked { " [locked]" } else { "" }
             ),
             Style::default().add_modifier(Modifier::BOLD),
@@ -172,6 +177,56 @@ fn draw_post(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect, vote_selecte
             Line::styled("[LOCKED]", Style::default().fg(Color::LightCyan)),
         );
     }
+    if let Some(proposal) = &post.proposal {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("Proposal · {}", proposal.state.label()),
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if proposal.state == salyut_bbs::protocol::ProposalState::Voting {
+            lines.push(Line::raw(format!(
+                "Voting closes {}",
+                proposal.closes_at.format("%Y-%m-%d %H:%M UTC")
+            )));
+        } else if let Some(closed_at) = proposal.closed_at {
+            lines.push(Line::raw(format!(
+                "Voting closed {}",
+                closed_at.format("%Y-%m-%d %H:%M UTC")
+            )));
+        }
+        for event in &proposal.events {
+            let actor = event.actor.as_ref().map_or_else(
+                || "system".to_owned(),
+                |actor| {
+                    event.actor_uid.map_or_else(
+                        || format!("@{actor}"),
+                        |uid| format!("@{actor} (uid {uid})"),
+                    )
+                },
+            );
+            let transition = event.from_state.map_or_else(
+                || event.to_state.label().to_owned(),
+                |from| format!("{} → {}", from.label(), event.to_state.label()),
+            );
+            let reason = event
+                .reason
+                .as_ref()
+                .map(|reason| format!(" — {reason}"))
+                .unwrap_or_default();
+            lines.push(Line::styled(
+                format!(
+                    "{} · {} · {}{}",
+                    event.created_at.format("%Y-%m-%d %H:%M UTC"),
+                    transition,
+                    actor,
+                    reason
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
     if let Some(poll) = &post.poll {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
@@ -220,38 +275,54 @@ fn draw_post(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect, vote_selecte
         }
     }
     lines.push(Line::raw(""));
-    let help = if vote_selected.is_some() {
-        "↑/↓: choose · Enter: vote/change vote · Esc: cancel".to_owned()
-    } else {
-        let mut commands = vec!["Esc/q: close".to_owned()];
-        if !post.locked {
-            commands.push("a: reply".to_owned());
-        }
-        if post.poll.is_some() && !post.locked {
-            commands.push("v: vote".to_owned());
-        }
-        if post.author == app.handle {
-            commands.push("e: edit post".to_owned());
-        }
-        if !post.replies.is_empty() {
-            commands.push("↑/↓: select reply".to_owned());
-            if post
-                .replies
-                .get(app.reply_selected)
-                .is_some_and(|reply| reply.author == app.handle)
-            {
-                commands.push("E/D: edit/delete reply".to_owned());
+    let help =
+        if vote_selected.is_some() {
+            "↑/↓: choose · Enter: vote/change vote · Esc: cancel".to_owned()
+        } else {
+            let mut commands = vec!["Esc/q: close".to_owned()];
+            if !post.locked {
+                commands.push("a: reply".to_owned());
             }
-        }
-        if app.groups.iter().any(|group| group == "wheel") {
-            commands.push(if post.locked {
-                "l: unlock".to_owned()
-            } else {
-                "l: lock".to_owned()
-            });
-        }
-        commands.join(" · ")
-    };
+            if post.proposal.as_ref().is_some_and(|proposal| {
+                proposal.state == salyut_bbs::protocol::ProposalState::Voting
+            }) {
+                commands.push("v: vote".to_owned());
+            }
+            if post.author == app.handle && post.proposal.is_none() {
+                commands.push("e: edit post".to_owned());
+            }
+            if post.author == app.handle
+                && post.proposal.as_ref().is_some_and(|proposal| {
+                    proposal.state == salyut_bbs::protocol::ProposalState::Voting
+                })
+            {
+                commands.push("w: withdraw".to_owned());
+            }
+            if !post.replies.is_empty() {
+                commands.push("↑/↓: select reply".to_owned());
+                if post
+                    .replies
+                    .get(app.reply_selected)
+                    .is_some_and(|reply| reply.author == app.handle)
+                {
+                    commands.push("E/D: edit/delete reply".to_owned());
+                }
+            }
+            if app.groups.iter().any(|group| group == "wheel") {
+                commands.push(if post.locked {
+                    "l: unlock".to_owned()
+                } else {
+                    "l: lock".to_owned()
+                });
+                if post.proposal.as_ref().is_some_and(|proposal| {
+                    proposal.state == salyut_bbs::protocol::ProposalState::Accepted
+                }) {
+                    commands.push("x: veto".to_owned());
+                    commands.push("i: implemented".to_owned());
+                }
+            }
+            commands.join(" · ")
+        };
     lines.push(Line::styled(help, Style::default().fg(Color::DarkGray)));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -263,15 +334,20 @@ fn draw_post(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect, vote_selecte
 
 fn draw_editor(frame: &mut ratatui::Frame<'_>, editor: &Editor, area: Rect) {
     frame.render_widget(Clear, area);
-    if editor.target.is_reply() {
+    if editor.target.is_reply() || editor.target.is_note() {
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(5), Constraint::Length(2)])
             .split(area);
+        let title = match editor.target {
+            super::EditorTarget::VetoProposal(_) => " Veto reason ",
+            super::EditorTarget::ImplementProposal(_) => " Implementation note ",
+            _ => " Reply ",
+        };
         frame.render_widget(
             Paragraph::new(editor.body.as_str())
                 .wrap(Wrap { trim: false })
-                .block(editor_block(" Reply ", true)),
+                .block(editor_block(title, true)),
             sections[0],
         );
         frame.render_widget(
@@ -284,20 +360,11 @@ fn draw_editor(frame: &mut ratatui::Frame<'_>, editor: &Editor, area: Rect) {
         );
         return;
     }
-    let constraints = if editor.creates_poll {
-        vec![
-            Constraint::Length(3),
-            Constraint::Percentage(45),
-            Constraint::Percentage(35),
-            Constraint::Length(2),
-        ]
-    } else {
-        vec![
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(2),
-        ]
-    };
+    let constraints = vec![
+        Constraint::Length(3),
+        Constraint::Min(5),
+        Constraint::Length(2),
+    ];
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -318,27 +385,13 @@ fn draw_editor(frame: &mut ratatui::Frame<'_>, editor: &Editor, area: Rect) {
             )),
         sections[1],
     );
-    let help_index = if editor.creates_poll {
-        frame.render_widget(
-            Paragraph::new(editor.options.as_str())
-                .wrap(Wrap { trim: false })
-                .block(editor_block(
-                    " Poll options — one per line ",
-                    matches!(editor.field, EditorField::Options),
-                )),
-            sections[2],
-        );
-        3
-    } else {
-        2
-    };
     frame.render_widget(
         Paragraph::new(format!(
             "/{} · Tab: switch field · Ctrl-S: save · Esc: cancel",
             editor.board_slug
         ))
         .style(Style::default().fg(Color::DarkGray)),
-        sections[help_index],
+        sections[2],
     );
 }
 
@@ -381,6 +434,14 @@ fn draw_confirmation(
             } else {
                 format!("Unlock “{title}”?")
             }
+        }
+        ConfirmAction::WithdrawProposal => {
+            let title = app
+                .viewed
+                .as_ref()
+                .map(|post| post.title.as_str())
+                .unwrap_or("this proposal");
+            format!("Withdraw “{title}”?")
         }
     };
     let selected = Style::default()
