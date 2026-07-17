@@ -69,7 +69,7 @@ fn draw_board_description(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect)
     let restriction = board
         .write_group
         .as_ref()
-        .map(|group| format!(" · write access: {group}"))
+        .map(|group| format!(" · new threads: {group}"))
         .unwrap_or_default();
     frame.render_widget(
         Paragraph::new(format!(

@@ -313,9 +313,6 @@ fn create_reply(
     if post.locked {
         return Ok(error(ErrorCode::Forbidden, "post is locked"));
     }
-    if !can_write(&post.board, account) {
-        return Ok(forbidden_for_board(&post.board));
-    }
     Ok(
         match database.create_reply(account.uid, &account.username, post_id, body)? {
             Some(post) => Response::Replied(post),
@@ -488,6 +485,50 @@ mod tests {
                 }
             ),
             Response::LockChanged(Post { locked: true, .. })
+        ));
+    }
+
+    #[test]
+    fn updates_allow_replies_from_non_wheel_users() {
+        let database = Mutex::new(Database::open(Path::new(":memory:")).unwrap());
+        let post = {
+            let mut database = database.lock().unwrap();
+            let board = database.board("updates").unwrap().unwrap();
+            database
+                .create(&board, 1001, "alice", "Maintenance", "Tonight at 20:00.")
+                .unwrap()
+        };
+        let account = Account {
+            uid: 1002,
+            username: "bob".to_owned(),
+            groups: vec!["users".to_owned()],
+        };
+
+        assert!(matches!(
+            dispatch(
+                &database,
+                &account,
+                Request::CreatePost {
+                    board: "updates".to_owned(),
+                    title: "Not allowed".to_owned(),
+                    body: "Top-level post".to_owned(),
+                }
+            ),
+            Response::Error {
+                code: ErrorCode::Forbidden,
+                ..
+            }
+        ));
+        assert!(matches!(
+            dispatch(
+                &database,
+                &account,
+                Request::CreateReply {
+                    post_id: post.id,
+                    body: "Thanks for the warning.".to_owned(),
+                }
+            ),
+            Response::Replied(Post { replies, .. }) if replies.len() == 1
         ));
     }
 }

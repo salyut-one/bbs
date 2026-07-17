@@ -131,7 +131,7 @@ fn board_card(board: &Board) -> String {
         .as_ref()
         .map(|group| {
             format!(
-                " <small>(posting requires the {} group)</small>",
+                " <small>(starting threads requires the {} group)</small>",
                 escape(group)
             )
         })

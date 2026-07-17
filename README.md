@@ -11,7 +11,7 @@ There are three processes:
 The daemon creates three boards on first start:
 
 - **General** - open to all users.
-- **Updates** - only members of `wheel` may post.
+- **Updates** — only members of `wheel` may start threads; every user may reply.
 - **Proposals** - polls with one vote per Unix UID. Voting again changes the
   existing vote.
 
