@@ -1,0 +1,74 @@
+body {
+  background-color: #212121;
+  color: #fafafa;
+  max-width: 85ch;
+  margin: 2rem auto;
+  padding: 0 1.25rem;
+  line-height: 1.5;
+}
+
+hr {
+  border: none;
+  height: 2px;
+  background-color: #424242;
+}
+
+a,
+a:visited,
+a:hover,
+a:active,
+a:focus,
+.toplinks {
+  color: #bababa;
+  font-family: monospace;
+}
+
+.toplinks {
+  display: flex;
+  gap: 1ch;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.footer,
+.byline,
+small,
+.posts span {
+  color: #bababa;
+  font-size: 12px;
+}
+
+.locked {
+  color: #bababa;
+  font-family: monospace;
+}
+
+.reply {
+  border-left: 2px solid #424242;
+  margin: 1rem 0;
+  padding-left: 1rem;
+}
+
+.boards li,
+.posts li,
+.poll li {
+  margin-bottom: 0.6rem;
+}
+
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+.poll-meter {
+  width: min(32rem, 100%);
+  height: 0.75rem;
+  background: #424242;
+}
+
+.poll-meter > span {
+  display: block;
+  height: 100%;
+  background: #bababa;
+}
