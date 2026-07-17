@@ -531,4 +531,32 @@ mod tests {
             Response::Replied(Post { replies, .. }) if replies.len() == 1
         ));
     }
+
+    #[test]
+    fn proposals_are_open_to_non_wheel_users() {
+        let database = Mutex::new(Database::open(Path::new(":memory:")).unwrap());
+        let account = Account {
+            uid: 1002,
+            username: "bob".to_owned(),
+            groups: vec!["users".to_owned()],
+        };
+
+        assert!(matches!(
+            dispatch(
+                &database,
+                &account,
+                Request::CreatePoll {
+                    board: "proposals".to_owned(),
+                    title: "Add a garden?".to_owned(),
+                    body: "A small shared garden behind the server room.".to_owned(),
+                    options: vec!["Yes".to_owned(), "No".to_owned()],
+                }
+            ),
+            Response::Created(Post {
+                author,
+                poll: Some(_),
+                ..
+            }) if author == "bob"
+        ));
+    }
 }

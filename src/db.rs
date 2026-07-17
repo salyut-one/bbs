@@ -588,6 +588,8 @@ mod tests {
             ["general", "updates", "proposals"]
         );
         assert_eq!(boards[1].write_group.as_deref(), Some("wheel"));
+        assert!(boards[0].write_group.is_none());
+        assert!(boards[2].write_group.is_none());
     }
 
     #[test]

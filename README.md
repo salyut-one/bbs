@@ -12,8 +12,8 @@ The daemon creates three boards on first start:
 
 - **General** - open to all users.
 - **Updates** — only members of `wheel` may start threads; every user may reply.
-- **Proposals** - polls with one vote per Unix UID. Voting again changes the
-  existing vote.
+- **Proposals** — every user may submit polls and vote once per Unix UID.
+  Voting again changes the existing vote.
 
 Threads accept replies. Reply authors can edit or delete their own replies, and
 members of `wheel` can lock any thread. A locked thread rejects new replies,
