@@ -1,3 +1,13 @@
+:root {
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
 body {
   background-color: #212121;
   color: #fafafa;
@@ -30,9 +40,18 @@ a:focus,
   white-space: nowrap;
 }
 
+a:focus-visible {
+  outline: 2px solid #fafafa;
+  outline-offset: 2px;
+}
+
 .footer,
+small {
+  color: #bababa;
+  font-size: 12px;
+}
+
 .byline,
-small,
 .posts span {
   color: #bababa;
   font-size: 12px;

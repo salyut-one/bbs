@@ -118,8 +118,9 @@ fn render_index(client: &Client) -> Result<String> {
     Ok(page(
         "Message board",
         &format!(
-            "<h1>bbs.salyut.one</h1>\
-             <p>This is the read-only web view. Log in over SSH to post or vote.</p><hr>\
+            "<h1>Bulletin Board System</h1>\
+             <p>Browse posts here, or log in over SSH and run <code>bbs</code> \
+             to post, reply, and vote.</p><hr>\
              <h2>Boards</h2><ul class=\"boards\">{content}</ul>"
         ),
     ))
@@ -282,7 +283,7 @@ fn post_html(post: &Post) -> String {
             .as_ref()
             .is_some_and(|proposal| proposal.state == ProposalState::Voting)
         {
-            "Log in through the terminal to vote."
+            "Log in over SSH and run bbs to vote."
         } else {
             "Voting is closed."
         };
@@ -316,7 +317,7 @@ fn post_html(post: &Post) -> String {
     let reply_status = if post.locked {
         "<p>Replies are closed.</p>"
     } else {
-        "<p>Log in through the terminal to reply.</p>"
+        "<p>Log in over SSH and run <code>bbs</code> to reply.</p>"
     };
     format!(
         "<h1>{title}</h1>{locked}<p class=\"byline\">\
@@ -341,12 +342,12 @@ fn page(title: &str, content: &str) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>{} · Salyut BBS</title><style>{}</style></head>\
+         <title>{} · salyut.one BBS</title><style>{}</style></head>\
          <body><main><nav class=\"toplinks\"><a href=\"/\">[BBS Home]</a> \
          <a href=\"https://salyut.one\">[salyut.one]</a> \
          <a href=\"https://salyut.one/users\">[User List]</a></nav>{}\
-         <hr><footer class=\"footer\">salyut.one BBS · terminal members post and vote \
-         with <code>salyut-bbs</code>.</footer></main></body></html>",
+         <hr><footer class=\"footer\">Want to take part? Log in over SSH and run \
+         <code>bbs</code> to post, reply, and vote.</footer></main></body></html>",
         escape(title),
         CSS,
         content
@@ -422,6 +423,10 @@ mod tests {
     fn global_navigation_links_to_user_list() {
         let html = page("Title", "<p>Body</p>");
         assert!(html.contains("href=\"https://salyut.one/users\">[User List]</a>"));
+        assert!(html.contains("Want to take part?"));
+        assert!(html.contains("<code>bbs</code>"));
+        assert!(!html.contains("terminal members"));
+        assert!(!html.contains("<code>salyut-bbs</code>"));
         assert!(!html.contains("Service Status"));
     }
 

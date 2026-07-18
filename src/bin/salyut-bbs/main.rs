@@ -1,8 +1,17 @@
-use std::{io, path::PathBuf, time::Duration};
+use std::{
+    env,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use salyut_bbs::{
     client::Client,
@@ -21,7 +30,6 @@ struct Arguments {
 enum Mode {
     Browse,
     View,
-    Edit(Editor),
     Vote(usize),
     Confirm(ConfirmAction, bool),
 }
@@ -40,7 +48,6 @@ struct Editor {
     title: String,
     body: String,
     creates_proposal: bool,
-    field: EditorField,
 }
 
 #[derive(Clone, Copy)]
@@ -54,10 +61,6 @@ enum EditorTarget {
 }
 
 impl EditorTarget {
-    fn is_reply(&self) -> bool {
-        matches!(self, Self::NewReply(_) | Self::EditReply { .. })
-    }
-
     fn returns_to_view(&self) -> bool {
         matches!(
             self,
@@ -68,15 +71,26 @@ impl EditorTarget {
         )
     }
 
-    fn is_note(&self) -> bool {
-        matches!(self, Self::VetoProposal(_) | Self::ImplementProposal(_))
+    fn has_title(&self) -> bool {
+        matches!(self, Self::NewPost | Self::EditPost(_))
     }
 }
 
-#[derive(Clone, Copy)]
-enum EditorField {
-    Title,
-    Body,
+enum EditResult {
+    Saved,
+    Cancelled,
+}
+
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TempFile {
+    path: PathBuf,
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 struct App {
@@ -196,31 +210,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Char('q') => confirmation_destination(action),
             _ => Mode::Confirm(action, yes),
         },
-        Mode::Edit(mut editor) => {
-            if key.code == KeyCode::Esc {
-                if editor.target.returns_to_view() {
-                    Mode::View
-                } else {
-                    Mode::Browse
-                }
-            } else if key.code == KeyCode::Char('s')
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-            {
-                let returns_to_view = editor.target.returns_to_view();
-                if app.save(&editor) {
-                    if returns_to_view {
-                        Mode::View
-                    } else {
-                        Mode::Browse
-                    }
-                } else {
-                    Mode::Edit(editor)
-                }
-            } else {
-                edit_key(&mut editor, key);
-                Mode::Edit(editor)
-            }
-        }
     };
 }
 
@@ -235,14 +224,16 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> Mode {
                 app.message = app.write_denied_message();
             } else {
                 let board = app.current_board();
-                return Mode::Edit(Editor {
-                    target: EditorTarget::NewPost,
-                    board_slug: board.slug.clone(),
-                    title: String::new(),
-                    body: String::new(),
-                    creates_proposal: board.kind == BoardKind::Polls,
-                    field: EditorField::Title,
-                });
+                return edit(
+                    app,
+                    Editor {
+                        target: EditorTarget::NewPost,
+                        board_slug: board.slug.clone(),
+                        title: String::new(),
+                        body: String::new(),
+                        creates_proposal: board.kind == BoardKind::Polls,
+                    },
+                );
             }
         }
         KeyCode::Char('e') => {
@@ -252,14 +243,16 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> Mode {
                     return Mode::Browse;
                 }
                 if post.author == app.handle {
-                    return Mode::Edit(Editor {
-                        target: EditorTarget::EditPost(post.id),
-                        board_slug: post.board.slug,
-                        title: post.title,
-                        body: post.body,
-                        creates_proposal: false,
-                        field: EditorField::Title,
-                    });
+                    return edit(
+                        app,
+                        Editor {
+                            target: EditorTarget::EditPost(post.id),
+                            board_slug: post.board.slug,
+                            title: post.title,
+                            body: post.body,
+                            creates_proposal: false,
+                        },
+                    );
                 }
                 app.message = "You can only edit your own posts".to_owned();
             }
@@ -330,14 +323,16 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
                     app.message = "Proposals cannot be edited after voting begins".to_owned();
                     return Mode::View;
                 }
-                Mode::Edit(Editor {
-                    target: EditorTarget::EditPost(post.id),
-                    board_slug: post.board.slug.clone(),
-                    title: post.title.clone(),
-                    body: post.body.clone(),
-                    creates_proposal: false,
-                    field: EditorField::Title,
-                })
+                edit(
+                    app,
+                    Editor {
+                        target: EditorTarget::EditPost(post.id),
+                        board_slug: post.board.slug.clone(),
+                        title: post.title.clone(),
+                        body: post.body.clone(),
+                        creates_proposal: false,
+                    },
+                )
             } else {
                 app.message = "You can only edit your own posts".to_owned();
                 Mode::View
@@ -349,14 +344,16 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
                     app.message = "This post is locked".to_owned();
                     return Mode::View;
                 }
-                return Mode::Edit(Editor {
-                    target: EditorTarget::NewReply(post.id),
-                    board_slug: post.board.slug.clone(),
-                    title: String::new(),
-                    body: String::new(),
-                    creates_proposal: false,
-                    field: EditorField::Body,
-                });
+                return edit(
+                    app,
+                    Editor {
+                        target: EditorTarget::NewReply(post.id),
+                        board_slug: post.board.slug.clone(),
+                        title: String::new(),
+                        body: String::new(),
+                        creates_proposal: false,
+                    },
+                );
             }
             Mode::View
         }
@@ -372,7 +369,7 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
             app.reply_selected = app.reply_selected.saturating_sub(1);
             Mode::View
         }
-        KeyCode::Char('E') => {
+        KeyCode::Char('u') => {
             let Some(post) = &app.viewed else {
                 return Mode::View;
             };
@@ -384,16 +381,18 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
                 app.message = "You can only edit your own replies".to_owned();
                 return Mode::View;
             }
-            Mode::Edit(Editor {
-                target: EditorTarget::EditReply { id: reply.id },
-                board_slug: post.board.slug.clone(),
-                title: String::new(),
-                body: reply.body.clone(),
-                creates_proposal: false,
-                field: EditorField::Body,
-            })
+            edit(
+                app,
+                Editor {
+                    target: EditorTarget::EditReply { id: reply.id },
+                    board_slug: post.board.slug.clone(),
+                    title: String::new(),
+                    body: reply.body.clone(),
+                    creates_proposal: false,
+                },
+            )
         }
-        KeyCode::Char('D') => {
+        KeyCode::Char('d') => {
             let Some(reply) = app
                 .viewed
                 .as_ref()
@@ -451,14 +450,16 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
             } else {
                 EditorTarget::ImplementProposal(post.id)
             };
-            Mode::Edit(Editor {
-                target,
-                board_slug: post.board.slug.clone(),
-                title: String::new(),
-                body: String::new(),
-                creates_proposal: false,
-                field: EditorField::Body,
-            })
+            edit(
+                app,
+                Editor {
+                    target,
+                    board_slug: post.board.slug.clone(),
+                    title: String::new(),
+                    body: String::new(),
+                    creates_proposal: false,
+                },
+            )
         }
         _ => Mode::View,
     }
@@ -473,39 +474,131 @@ fn confirmation_destination(action: ConfirmAction) -> Mode {
     }
 }
 
-fn edit_key(editor: &mut Editor, key: KeyEvent) {
-    if (editor.target.is_reply() || editor.target.is_note())
-        && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
-    {
-        return;
-    }
-    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-        editor.field = match (editor.field, key.code) {
-            (EditorField::Title, KeyCode::Tab) => EditorField::Body,
-            (EditorField::Body, KeyCode::Tab) => EditorField::Title,
-            (EditorField::Title, KeyCode::BackTab) => EditorField::Body,
-            (EditorField::Body, KeyCode::BackTab) => EditorField::Title,
-            _ => editor.field,
-        };
-        return;
-    }
-    let value = match editor.field {
-        EditorField::Title => &mut editor.title,
-        EditorField::Body => &mut editor.body,
+fn edit(app: &mut App, mut editor: Editor) -> Mode {
+    let destination = if editor.target.returns_to_view() {
+        Mode::View
+    } else {
+        Mode::Browse
     };
-    match key.code {
-        KeyCode::Backspace => {
-            value.pop();
+    match edit_externally(&mut editor) {
+        Ok(EditResult::Saved) => {
+            app.save(&editor);
         }
-        KeyCode::Enter if !matches!(editor.field, EditorField::Title) => value.push('\n'),
-        KeyCode::Char(character)
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::SUPER) =>
-        {
-            value.push(character);
+        Ok(EditResult::Cancelled) => {
+            app.message = "Edit cancelled".to_owned();
         }
-        _ => {}
+        Err(error) => {
+            app.message = format!("Could not complete edit: {error:#}");
+        }
     }
+    destination
+}
+
+fn edit_externally(editor: &mut Editor) -> Result<EditResult> {
+    let (temporary, mut file) = create_temp_file()?;
+    file.write_all(render_editor_document(editor).as_bytes())
+        .context("write editor file")?;
+    file.flush().context("flush editor file")?;
+    drop(file);
+
+    if let Err(error) = suspend_terminal() {
+        let _ = resume_terminal();
+        return Err(error.context("suspend terminal for editor"));
+    }
+    let editor_result = run_editor(&temporary.path);
+    let resume_result = resume_terminal();
+    if let Err(error) = resume_result {
+        return Err(error.context("restore terminal after editor"));
+    }
+    let status = editor_result?;
+    if !status.success() {
+        return Ok(EditResult::Cancelled);
+    }
+
+    let document = fs::read_to_string(&temporary.path).context("read editor file")?;
+    parse_editor_document(editor, &document)?;
+    Ok(EditResult::Saved)
+}
+
+fn create_temp_file() -> Result<(TempFile, File)> {
+    let directory = env::temp_dir();
+    for _ in 0..100 {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!("salyut-bbs-{}-{sequence}.txt", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => return Ok((TempFile { path }, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error).context("create editor file"),
+        }
+    }
+    bail!("could not allocate a temporary editor file")
+}
+
+fn suspend_terminal() -> Result<()> {
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
+    Ok(())
+}
+
+fn resume_terminal() -> Result<()> {
+    crossterm::execute!(
+        io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::cursor::Hide
+    )?;
+    crossterm::terminal::enable_raw_mode()?;
+    Ok(())
+}
+
+fn run_editor(path: &Path) -> Result<std::process::ExitStatus> {
+    let editor = env::var("EDITOR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "vi".to_owned());
+    Command::new("/bin/sh")
+        .args(["-c", "exec $EDITOR \"$1\"", "salyut-bbs"])
+        .arg(path)
+        .env("EDITOR", editor)
+        .status()
+        .context("start $EDITOR")
+}
+
+fn render_editor_document(editor: &Editor) -> String {
+    if editor.target.has_title() {
+        format!("Title: {}\n\n{}", editor.title, editor.body)
+    } else {
+        editor.body.clone()
+    }
+}
+
+fn parse_editor_document(editor: &mut Editor, document: &str) -> Result<()> {
+    let normalized = document.replace("\r\n", "\n");
+    if editor.target.has_title() {
+        let (header, remainder) = normalized
+            .split_once('\n')
+            .ok_or_else(|| anyhow!("expected a `Title:` line followed by a blank line"))?;
+        let title = header
+            .strip_prefix("Title:")
+            .ok_or_else(|| anyhow!("the first line must start with `Title:`"))?
+            .trim();
+        let body = remainder
+            .strip_prefix('\n')
+            .ok_or_else(|| anyhow!("expected a blank line after the title"))?;
+        editor.title = title.to_owned();
+        editor.body = body.trim_end_matches('\n').to_owned();
+    } else {
+        editor.body = normalized.trim_end_matches('\n').to_owned();
+    }
+    Ok(())
 }
 
 impl App {
@@ -697,5 +790,59 @@ impl App {
             }
             Err(error) => self.message = error.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn post_editor() -> Editor {
+        Editor {
+            target: EditorTarget::NewPost,
+            board_slug: "general".to_owned(),
+            title: "Initial title".to_owned(),
+            body: "Initial body".to_owned(),
+            creates_proposal: false,
+        }
+    }
+
+    #[test]
+    fn post_document_round_trips_title_and_body() {
+        let mut editor = post_editor();
+        parse_editor_document(
+            &mut editor,
+            "Title: A clearer title\n\nFirst line\nSecond line\n",
+        )
+        .unwrap();
+
+        assert_eq!(editor.title, "A clearer title");
+        assert_eq!(editor.body, "First line\nSecond line");
+        assert_eq!(
+            render_editor_document(&editor),
+            "Title: A clearer title\n\nFirst line\nSecond line"
+        );
+    }
+
+    #[test]
+    fn post_document_requires_title_header_and_separator() {
+        let mut editor = post_editor();
+        assert!(parse_editor_document(&mut editor, "A title\n\nBody").is_err());
+        assert!(parse_editor_document(&mut editor, "Title: A title\nBody").is_err());
+    }
+
+    #[test]
+    fn reply_document_is_body_only() {
+        let mut editor = Editor {
+            target: EditorTarget::NewReply(7),
+            board_slug: "general".to_owned(),
+            title: String::new(),
+            body: String::new(),
+            creates_proposal: false,
+        };
+        parse_editor_document(&mut editor, "A reply\nwith two lines\n").unwrap();
+
+        assert_eq!(editor.body, "A reply\nwith two lines");
+        assert_eq!(render_editor_document(&editor), "A reply\nwith two lines");
     }
 }

@@ -1,11 +1,12 @@
 # salyut-bbs
 
-The message board for [salyut.one](https://salyut.one).
+The message board for [salyut.one](https://salyut.one), an all-purpose, small,
+tilde-adjacent pubnix running Fedora 44.
 
 There are three processes:
 
 - `salyut-bbsd` owns the database and checks Unix credentials.
-- `salyut-bbs` is the terminal client.
+- `salyut-bbs` is the terminal client, installed with the shorter `bbs` alias.
 - `salyut-bbs-web` serves a read-only HTML view on `127.0.0.1:8080`.
 
 The daemon creates three boards on first start:
@@ -32,11 +33,11 @@ proposal polls keep their votes and option labels; the first option is treated
 as For, the second as Against, and any remaining options as abstentions when
 calculating the result.
 
-## Build
+## Build and test
 
 ```sh
-cargo build --release --locked
-cargo test --locked
+make check
+make build
 ```
 
 CI builds and tests in a Fedora 44 container. macOS remains covered for local
@@ -58,19 +59,23 @@ cargo run --bin salyut-bbs-web
 ```
 
 Use `[` and `]` to change boards, `j`/`k` to move, Enter to read, and
-`n`/`e`/`d` to create, edit, or delete. Ctrl-S saves. Press `v` while reading a
-proposal to vote. While reading, `a` writes a reply, uppercase `E`/`D` edits or
-deletes the selected reply, and `l` locks or unlocks the thread for members of
-`wheel`. Proposal authors press `w` to withdraw while voting is open. Members
-of `wheel` press `x` to record a veto or `i` to record implementation after a
-proposal has been accepted.
+`n`/`e`/`d` to create, edit, or delete. Writing opens `$EDITOR`, falling back
+to `vi` when it is unset; save and close the editor to submit. Press `v` while
+reading a proposal to vote. While reading, `a` writes a reply, `u` updates the
+selected reply, `d` deletes it, and `l` locks or unlocks the thread for members
+of `wheel`. Proposal authors press `w` to withdraw while voting is open.
+Members of `wheel` press `x` to record a veto or `i` to record implementation
+after a proposal has been accepted.
 
 ## Fedora 44
 
-Install the three release binaries in `/usr/local/bin`, then create the service
-accounts and socket groups as root:
+Build and install the three binaries, systemd units, and tmpfiles rule, then
+create the service accounts and socket groups as root:
 
 ```sh
+make check
+make build
+sudo make install
 groupadd --system salyut-bbs
 groupadd --system salyut-bbs-web
 useradd --system --gid salyut-bbs --home-dir /var/lib/salyut-bbs \
@@ -80,12 +85,9 @@ useradd --system --gid salyut-bbs-web --home-dir /nonexistent \
 usermod --append --groups salyut-bbs alice
 ```
 
-Install the systemd units and tmpfiles rule, create the runtime directories, and
-start both services:
+Create the runtime directories and start both services:
 
 ```sh
-install -m 0644 etc/systemd/system/*.service /etc/systemd/system/
-install -m 0644 etc/tmpfiles.d/salyut-bbs.conf /etc/tmpfiles.d/
 systemd-tmpfiles --create /etc/tmpfiles.d/salyut-bbs.conf
 systemctl daemon-reload
 systemctl enable --now salyut-bbsd.service salyut-bbs-web.service

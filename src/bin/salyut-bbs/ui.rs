@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use super::{App, ConfirmAction, Editor, EditorField, Mode};
+use super::{App, ConfirmAction, Mode};
 
 pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
@@ -15,7 +15,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(area);
 
@@ -27,7 +27,6 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     match &app.mode {
         Mode::View => draw_post(frame, app, centered(area, 88, 84), None),
         Mode::Vote(selected) => draw_post(frame, app, centered(area, 88, 84), Some(*selected)),
-        Mode::Edit(editor) => draw_editor(frame, editor, centered(area, 90, 90)),
         Mode::Confirm(action, yes) => {
             draw_confirmation(frame, app, *action, *yes, centered(area, 54, 24))
         }
@@ -38,10 +37,10 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 fn draw_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     let mut line = vec![
         Span::styled(
-            " SALYUT.ONE BBS ",
+            " salyut.one bbs ",
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::LightCyan)
+                .bg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!("  @{}  ", app.handle)),
@@ -50,10 +49,10 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         let style = if index == app.board_selected {
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::LightCyan)
+                .bg(Color::Gray)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::LightCyan)
+            Style::default().fg(Color::Gray)
         };
         line.push(Span::styled(format!(" {} ", board.name), style));
         line.push(Span::raw(" "));
@@ -95,7 +94,7 @@ fn draw_post_list(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
             .highlight_style(
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::LightCyan)
+                    .bg(Color::Gray)
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("» "),
@@ -136,21 +135,43 @@ fn post_item(post: &salyut_bbs::protocol::PostSummary) -> ListItem<'_> {
 
 fn draw_help(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("[/]", Style::default().fg(Color::LightCyan)),
-            Span::raw(" board  "),
-            Span::styled("↑/↓", Style::default().fg(Color::LightCyan)),
-            Span::raw(" move  "),
-            Span::styled("Enter", Style::default().fg(Color::LightCyan)),
-            Span::raw(" read  "),
-            Span::styled("n/e/d", Style::default().fg(Color::LightCyan)),
-            Span::raw(" new/edit/delete  "),
-            Span::styled("r/q", Style::default().fg(Color::LightCyan)),
-            Span::raw(format!(" refresh/quit  │ {}", app.message)),
+        Paragraph::new(Text::from(vec![
+            Line::from(vec![
+                key("←/→"),
+                Span::raw(" boards  "),
+                key("↑/↓"),
+                Span::raw(" select  "),
+                key("enter"),
+                Span::raw(" open  "),
+                key("n"),
+                Span::raw(" new  "),
+                key("e"),
+                Span::raw(" edit  "),
+                key("d"),
+                Span::raw(" delete  "),
+                key("r"),
+                Span::raw(" refresh  "),
+                key("q"),
+                Span::raw(" quit"),
+            ]),
+            Line::styled(
+                format!("status: {}", app.message),
+                Style::default().fg(Color::Gray),
+            ),
         ]))
         .block(Block::default().borders(Borders::ALL)),
         area,
     );
+}
+
+fn key(label: &'static str) -> Span<'static> {
+    Span::styled(
+        format!(" {label} "),
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn draw_post(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect, vote_selected: Option<usize>) {
@@ -174,15 +195,15 @@ fn draw_post(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect, vote_selecte
     if post.locked {
         lines.insert(
             2,
-            Line::styled("[LOCKED]", Style::default().fg(Color::LightCyan)),
+            Line::styled("[locked]", Style::default().fg(Color::Gray)),
         );
     }
     if let Some(proposal) = &post.proposal {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            format!("Proposal · {}", proposal.state.label()),
+            format!("proposal · {}", proposal.state.label()),
             Style::default()
-                .fg(Color::LightCyan)
+                .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
         ));
         if proposal.state == salyut_bbs::protocol::ProposalState::Voting {
@@ -230,8 +251,8 @@ fn draw_post(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect, vote_selecte
     if let Some(poll) = &post.poll {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            format!("Poll · {} total vote(s)", poll.total_votes),
-            Style::default().fg(Color::LightCyan),
+            format!("poll · {} total vote(s)", poll.total_votes),
+            Style::default().fg(Color::Gray),
         ));
         for (index, option) in poll.options.iter().enumerate() {
             let marker = if vote_selected == Some(index) {
@@ -252,8 +273,8 @@ fn draw_post(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect, vote_selecte
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        format!("Replies · {}", post.replies.len()),
-        Style::default().fg(Color::LightCyan),
+        format!("replies · {}", post.replies.len()),
+        Style::default().fg(Color::Gray),
     ));
     for (index, reply) in post.replies.iter().enumerate() {
         let marker = if index == app.reply_selected {
@@ -305,7 +326,8 @@ fn draw_post(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect, vote_selecte
                     .get(app.reply_selected)
                     .is_some_and(|reply| reply.author == app.handle)
                 {
-                    commands.push("E/D: edit/delete reply".to_owned());
+                    commands.push("u: update reply".to_owned());
+                    commands.push("d: delete reply".to_owned());
                 }
             }
             if app.groups.iter().any(|group| group == "wheel") {
@@ -323,87 +345,13 @@ fn draw_post(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect, vote_selecte
             }
             commands.join(" · ")
         };
-    lines.push(Line::styled(help, Style::default().fg(Color::DarkGray)));
+    lines.push(Line::styled(help, Style::default().fg(Color::Gray)));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
-            .block(Block::default().title(" Post ").borders(Borders::ALL)),
+            .block(Block::default().title(" post ").borders(Borders::ALL)),
         area,
     );
-}
-
-fn draw_editor(frame: &mut ratatui::Frame<'_>, editor: &Editor, area: Rect) {
-    frame.render_widget(Clear, area);
-    if editor.target.is_reply() || editor.target.is_note() {
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), Constraint::Length(2)])
-            .split(area);
-        let title = match editor.target {
-            super::EditorTarget::VetoProposal(_) => " Veto reason ",
-            super::EditorTarget::ImplementProposal(_) => " Implementation note ",
-            _ => " Reply ",
-        };
-        frame.render_widget(
-            Paragraph::new(editor.body.as_str())
-                .wrap(Wrap { trim: false })
-                .block(editor_block(title, true)),
-            sections[0],
-        );
-        frame.render_widget(
-            Paragraph::new(format!(
-                "/{} · Ctrl-S: save · Esc: cancel",
-                editor.board_slug
-            ))
-            .style(Style::default().fg(Color::DarkGray)),
-            sections[1],
-        );
-        return;
-    }
-    let constraints = vec![
-        Constraint::Length(3),
-        Constraint::Min(5),
-        Constraint::Length(2),
-    ];
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
-    frame.render_widget(
-        Paragraph::new(editor.title.as_str()).block(editor_block(
-            " Title ",
-            matches!(editor.field, EditorField::Title),
-        )),
-        sections[0],
-    );
-    frame.render_widget(
-        Paragraph::new(editor.body.as_str())
-            .wrap(Wrap { trim: false })
-            .block(editor_block(
-                " Body ",
-                matches!(editor.field, EditorField::Body),
-            )),
-        sections[1],
-    );
-    frame.render_widget(
-        Paragraph::new(format!(
-            "/{} · Tab: switch field · Ctrl-S: save · Esc: cancel",
-            editor.board_slug
-        ))
-        .style(Style::default().fg(Color::DarkGray)),
-        sections[2],
-    );
-}
-
-fn editor_block(title: &'static str, selected: bool) -> Block<'static> {
-    Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(if selected {
-            Style::default().fg(Color::LightCyan)
-        } else {
-            Style::default()
-        })
 }
 
 fn draw_confirmation(
@@ -446,9 +394,9 @@ fn draw_confirmation(
     };
     let selected = Style::default()
         .fg(Color::Black)
-        .bg(Color::LightCyan)
+        .bg(Color::Gray)
         .add_modifier(Modifier::BOLD);
-    let normal = Style::default().fg(Color::LightCyan);
+    let normal = Style::default().fg(Color::Gray);
     frame.render_widget(
         Paragraph::new(Text::from(vec![
             Line::raw(question),
@@ -461,11 +409,11 @@ fn draw_confirmation(
             Line::raw(""),
             Line::styled(
                 "←/→ or Tab: choose · Enter: confirm · Esc: cancel",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ),
         ]))
         .wrap(Wrap { trim: true })
-        .block(Block::default().title(" Confirm ").borders(Borders::ALL)),
+        .block(Block::default().title(" confirm ").borders(Borders::ALL)),
         area,
     );
 }
