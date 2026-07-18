@@ -1,17 +1,8 @@
-use std::{
-    env,
-    fs::{self, File, OpenOptions},
-    io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-    process::Command,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use std::{io, path::PathBuf, time::Duration};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use salyut_bbs::{
     client::Client,
@@ -30,6 +21,7 @@ struct Arguments {
 enum Mode {
     Browse,
     View,
+    Edit(Editor),
     Vote(usize),
     Confirm(ConfirmAction, bool),
 }
@@ -48,6 +40,9 @@ struct Editor {
     title: String,
     body: String,
     creates_proposal: bool,
+    field: EditorField,
+    title_cursor: usize,
+    body_cursor: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -61,6 +56,10 @@ enum EditorTarget {
 }
 
 impl EditorTarget {
+    fn is_reply(&self) -> bool {
+        matches!(self, Self::NewReply(_) | Self::EditReply { .. })
+    }
+
     fn returns_to_view(&self) -> bool {
         matches!(
             self,
@@ -71,25 +70,42 @@ impl EditorTarget {
         )
     }
 
-    fn has_title(&self) -> bool {
-        matches!(self, Self::NewPost | Self::EditPost(_))
+    fn is_note(&self) -> bool {
+        matches!(self, Self::VetoProposal(_) | Self::ImplementProposal(_))
     }
 }
 
-enum EditResult {
-    Saved,
-    Cancelled,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditorField {
+    Title,
+    Body,
 }
 
-static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-struct TempFile {
-    path: PathBuf,
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+impl Editor {
+    fn new(
+        target: EditorTarget,
+        board_slug: String,
+        title: String,
+        body: String,
+        creates_proposal: bool,
+    ) -> Self {
+        let field = if target.is_reply() || target.is_note() {
+            EditorField::Body
+        } else {
+            EditorField::Title
+        };
+        let title_cursor = title.len();
+        let body_cursor = body.len();
+        Self {
+            target,
+            board_slug,
+            title,
+            body,
+            creates_proposal,
+            field,
+            title_cursor,
+            body_cursor,
+        }
     }
 }
 
@@ -210,6 +226,31 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Char('q') => confirmation_destination(action),
             _ => Mode::Confirm(action, yes),
         },
+        Mode::Edit(mut editor) => {
+            if key.code == KeyCode::Esc {
+                if editor.target.returns_to_view() {
+                    Mode::View
+                } else {
+                    Mode::Browse
+                }
+            } else if key.code == KeyCode::Char('s')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                let returns_to_view = editor.target.returns_to_view();
+                if app.save(&editor) {
+                    if returns_to_view {
+                        Mode::View
+                    } else {
+                        Mode::Browse
+                    }
+                } else {
+                    Mode::Edit(editor)
+                }
+            } else {
+                edit_key(&mut editor, key);
+                Mode::Edit(editor)
+            }
+        }
     };
 }
 
@@ -224,16 +265,13 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> Mode {
                 app.message = app.write_denied_message();
             } else {
                 let board = app.current_board();
-                return edit(
-                    app,
-                    Editor {
-                        target: EditorTarget::NewPost,
-                        board_slug: board.slug.clone(),
-                        title: String::new(),
-                        body: String::new(),
-                        creates_proposal: board.kind == BoardKind::Polls,
-                    },
-                );
+                return Mode::Edit(Editor::new(
+                    EditorTarget::NewPost,
+                    board.slug.clone(),
+                    String::new(),
+                    String::new(),
+                    board.kind == BoardKind::Polls,
+                ));
             }
         }
         KeyCode::Char('e') => {
@@ -243,16 +281,13 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> Mode {
                     return Mode::Browse;
                 }
                 if post.author == app.handle {
-                    return edit(
-                        app,
-                        Editor {
-                            target: EditorTarget::EditPost(post.id),
-                            board_slug: post.board.slug,
-                            title: post.title,
-                            body: post.body,
-                            creates_proposal: false,
-                        },
-                    );
+                    return Mode::Edit(Editor::new(
+                        EditorTarget::EditPost(post.id),
+                        post.board.slug,
+                        post.title,
+                        post.body,
+                        false,
+                    ));
                 }
                 app.message = "You can only edit your own posts".to_owned();
             }
@@ -323,16 +358,13 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
                     app.message = "Proposals cannot be edited after voting begins".to_owned();
                     return Mode::View;
                 }
-                edit(
-                    app,
-                    Editor {
-                        target: EditorTarget::EditPost(post.id),
-                        board_slug: post.board.slug.clone(),
-                        title: post.title.clone(),
-                        body: post.body.clone(),
-                        creates_proposal: false,
-                    },
-                )
+                Mode::Edit(Editor::new(
+                    EditorTarget::EditPost(post.id),
+                    post.board.slug.clone(),
+                    post.title.clone(),
+                    post.body.clone(),
+                    false,
+                ))
             } else {
                 app.message = "You can only edit your own posts".to_owned();
                 Mode::View
@@ -344,16 +376,13 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
                     app.message = "This post is locked".to_owned();
                     return Mode::View;
                 }
-                return edit(
-                    app,
-                    Editor {
-                        target: EditorTarget::NewReply(post.id),
-                        board_slug: post.board.slug.clone(),
-                        title: String::new(),
-                        body: String::new(),
-                        creates_proposal: false,
-                    },
-                );
+                return Mode::Edit(Editor::new(
+                    EditorTarget::NewReply(post.id),
+                    post.board.slug.clone(),
+                    String::new(),
+                    String::new(),
+                    false,
+                ));
             }
             Mode::View
         }
@@ -381,16 +410,13 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
                 app.message = "You can only edit your own replies".to_owned();
                 return Mode::View;
             }
-            edit(
-                app,
-                Editor {
-                    target: EditorTarget::EditReply { id: reply.id },
-                    board_slug: post.board.slug.clone(),
-                    title: String::new(),
-                    body: reply.body.clone(),
-                    creates_proposal: false,
-                },
-            )
+            Mode::Edit(Editor::new(
+                EditorTarget::EditReply { id: reply.id },
+                post.board.slug.clone(),
+                String::new(),
+                reply.body.clone(),
+                false,
+            ))
         }
         KeyCode::Char('d') => {
             let Some(reply) = app
@@ -450,16 +476,13 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
             } else {
                 EditorTarget::ImplementProposal(post.id)
             };
-            edit(
-                app,
-                Editor {
-                    target,
-                    board_slug: post.board.slug.clone(),
-                    title: String::new(),
-                    body: String::new(),
-                    creates_proposal: false,
-                },
-            )
+            Mode::Edit(Editor::new(
+                target,
+                post.board.slug.clone(),
+                String::new(),
+                String::new(),
+                false,
+            ))
         }
         _ => Mode::View,
     }
@@ -474,131 +497,112 @@ fn confirmation_destination(action: ConfirmAction) -> Mode {
     }
 }
 
-fn edit(app: &mut App, mut editor: Editor) -> Mode {
-    let destination = if editor.target.returns_to_view() {
-        Mode::View
+fn edit_key(editor: &mut Editor, key: KeyEvent) {
+    if (editor.target.is_reply() || editor.target.is_note())
+        && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+    {
+        return;
+    }
+    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        editor.field = match editor.field {
+            EditorField::Title => EditorField::Body,
+            EditorField::Body => EditorField::Title,
+        };
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
+    {
+        return;
+    }
+
+    let field = editor.field;
+    let (value, cursor) = active_value_and_cursor(editor);
+    *cursor = (*cursor).min(value.len());
+    match key.code {
+        KeyCode::Left => *cursor = previous_char_boundary(value, *cursor),
+        KeyCode::Right => *cursor = next_char_boundary(value, *cursor),
+        KeyCode::Home => *cursor = line_start(value, *cursor),
+        KeyCode::End => *cursor = line_end(value, *cursor),
+        KeyCode::Up => *cursor = vertical_cursor(value, *cursor, -1),
+        KeyCode::Down => *cursor = vertical_cursor(value, *cursor, 1),
+        KeyCode::Backspace if *cursor > 0 => {
+            let previous = previous_char_boundary(value, *cursor);
+            value.replace_range(previous..*cursor, "");
+            *cursor = previous;
+        }
+        KeyCode::Delete if *cursor < value.len() => {
+            let next = next_char_boundary(value, *cursor);
+            value.replace_range(*cursor..next, "");
+        }
+        KeyCode::Enter if field == EditorField::Body => {
+            value.insert(*cursor, '\n');
+            *cursor += 1;
+        }
+        KeyCode::Char(character) => {
+            value.insert(*cursor, character);
+            *cursor += character.len_utf8();
+        }
+        _ => {}
+    }
+}
+
+fn active_value_and_cursor(editor: &mut Editor) -> (&mut String, &mut usize) {
+    match editor.field {
+        EditorField::Title => (&mut editor.title, &mut editor.title_cursor),
+        EditorField::Body => (&mut editor.body, &mut editor.body_cursor),
+    }
+}
+
+fn previous_char_boundary(value: &str, cursor: usize) -> usize {
+    value[..cursor]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_char_boundary(value: &str, cursor: usize) -> usize {
+    value[cursor..]
+        .chars()
+        .next()
+        .map_or(value.len(), |character| cursor + character.len_utf8())
+}
+
+fn line_start(value: &str, cursor: usize) -> usize {
+    value[..cursor].rfind('\n').map_or(0, |index| index + 1)
+}
+
+fn line_end(value: &str, cursor: usize) -> usize {
+    value[cursor..]
+        .find('\n')
+        .map_or(value.len(), |index| cursor + index)
+}
+
+fn vertical_cursor(value: &str, cursor: usize, direction: i8) -> usize {
+    let current_start = line_start(value, cursor);
+    let column = value[current_start..cursor].chars().count();
+    let (target_start, target_end) = if direction < 0 {
+        if current_start == 0 {
+            return cursor;
+        }
+        let target_end = current_start - 1;
+        let target_start = line_start(value, target_end);
+        (target_start, target_end)
     } else {
-        Mode::Browse
+        let current_end = line_end(value, cursor);
+        if current_end == value.len() {
+            return cursor;
+        }
+        let target_start = current_end + 1;
+        let target_end = line_end(value, target_start);
+        (target_start, target_end)
     };
-    match edit_externally(&mut editor) {
-        Ok(EditResult::Saved) => {
-            app.save(&editor);
-        }
-        Ok(EditResult::Cancelled) => {
-            app.message = "Edit cancelled".to_owned();
-        }
-        Err(error) => {
-            app.message = format!("Could not complete edit: {error:#}");
-        }
-    }
-    destination
+    byte_at_column(&value[target_start..target_end], column) + target_start
 }
 
-fn edit_externally(editor: &mut Editor) -> Result<EditResult> {
-    let (temporary, mut file) = create_temp_file()?;
-    file.write_all(render_editor_document(editor).as_bytes())
-        .context("write editor file")?;
-    file.flush().context("flush editor file")?;
-    drop(file);
-
-    if let Err(error) = suspend_terminal() {
-        let _ = resume_terminal();
-        return Err(error.context("suspend terminal for editor"));
-    }
-    let editor_result = run_editor(&temporary.path);
-    let resume_result = resume_terminal();
-    if let Err(error) = resume_result {
-        return Err(error.context("restore terminal after editor"));
-    }
-    let status = editor_result?;
-    if !status.success() {
-        return Ok(EditResult::Cancelled);
-    }
-
-    let document = fs::read_to_string(&temporary.path).context("read editor file")?;
-    parse_editor_document(editor, &document)?;
-    Ok(EditResult::Saved)
-}
-
-fn create_temp_file() -> Result<(TempFile, File)> {
-    let directory = env::temp_dir();
-    for _ in 0..100 {
-        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = directory.join(format!("salyut-bbs-{}-{sequence}.txt", std::process::id()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(file) => return Ok((TempFile { path }, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error).context("create editor file"),
-        }
-    }
-    bail!("could not allocate a temporary editor file")
-}
-
-fn suspend_terminal() -> Result<()> {
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(
-        io::stdout(),
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::cursor::Show
-    )?;
-    Ok(())
-}
-
-fn resume_terminal() -> Result<()> {
-    crossterm::execute!(
-        io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::cursor::Hide
-    )?;
-    crossterm::terminal::enable_raw_mode()?;
-    Ok(())
-}
-
-fn run_editor(path: &Path) -> Result<std::process::ExitStatus> {
-    let editor = env::var("EDITOR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "vi".to_owned());
-    Command::new("/bin/sh")
-        .args(["-c", "exec $EDITOR \"$1\"", "salyut-bbs"])
-        .arg(path)
-        .env("EDITOR", editor)
-        .status()
-        .context("start $EDITOR")
-}
-
-fn render_editor_document(editor: &Editor) -> String {
-    if editor.target.has_title() {
-        format!("Title: {}\n\n{}", editor.title, editor.body)
-    } else {
-        editor.body.clone()
-    }
-}
-
-fn parse_editor_document(editor: &mut Editor, document: &str) -> Result<()> {
-    let normalized = document.replace("\r\n", "\n");
-    if editor.target.has_title() {
-        let (header, remainder) = normalized
-            .split_once('\n')
-            .ok_or_else(|| anyhow!("expected a `Title:` line followed by a blank line"))?;
-        let title = header
-            .strip_prefix("Title:")
-            .ok_or_else(|| anyhow!("the first line must start with `Title:`"))?
-            .trim();
-        let body = remainder
-            .strip_prefix('\n')
-            .ok_or_else(|| anyhow!("expected a blank line after the title"))?;
-        editor.title = title.to_owned();
-        editor.body = body.trim_end_matches('\n').to_owned();
-    } else {
-        editor.body = normalized.trim_end_matches('\n').to_owned();
-    }
-    Ok(())
+fn byte_at_column(line: &str, column: usize) -> usize {
+    line.char_indices()
+        .nth(column)
+        .map_or(line.len(), |(index, _)| index)
 }
 
 impl App {
@@ -798,51 +802,75 @@ mod tests {
     use super::*;
 
     fn post_editor() -> Editor {
-        Editor {
-            target: EditorTarget::NewPost,
-            board_slug: "general".to_owned(),
-            title: "Initial title".to_owned(),
-            body: "Initial body".to_owned(),
-            creates_proposal: false,
-        }
-    }
-
-    #[test]
-    fn post_document_round_trips_title_and_body() {
-        let mut editor = post_editor();
-        parse_editor_document(
-            &mut editor,
-            "Title: A clearer title\n\nFirst line\nSecond line\n",
+        Editor::new(
+            EditorTarget::NewPost,
+            "general".to_owned(),
+            "Tea tiem".to_owned(),
+            "First line\nSecond line".to_owned(),
+            false,
         )
-        .unwrap();
-
-        assert_eq!(editor.title, "A clearer title");
-        assert_eq!(editor.body, "First line\nSecond line");
-        assert_eq!(
-            render_editor_document(&editor),
-            "Title: A clearer title\n\nFirst line\nSecond line"
-        );
     }
 
     #[test]
-    fn post_document_requires_title_header_and_separator() {
+    fn inserts_and_deletes_at_the_cursor() {
         let mut editor = post_editor();
-        assert!(parse_editor_document(&mut editor, "A title\n\nBody").is_err());
-        assert!(parse_editor_document(&mut editor, "Title: A title\nBody").is_err());
+        editor.title_cursor = "Tea ti".len();
+        edit_key(
+            &mut editor,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        edit_key(&mut editor, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        edit_key(
+            &mut editor,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(editor.title, "Tea time");
+        assert_eq!(editor.title_cursor, "Tea time".len());
     }
 
     #[test]
-    fn reply_document_is_body_only() {
-        let mut editor = Editor {
-            target: EditorTarget::NewReply(7),
-            board_slug: "general".to_owned(),
-            title: String::new(),
-            body: String::new(),
-            creates_proposal: false,
-        };
-        parse_editor_document(&mut editor, "A reply\nwith two lines\n").unwrap();
+    fn moves_across_lines_and_preserves_utf8_boundaries() {
+        let mut editor = post_editor();
+        editor.body = "café\ntea\nbiscuits".to_owned();
+        editor.body_cursor = "café\nte".len();
+        editor.field = EditorField::Body;
 
-        assert_eq!(editor.body, "A reply\nwith two lines");
-        assert_eq!(render_editor_document(&editor), "A reply\nwith two lines");
+        edit_key(&mut editor, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(&editor.body[..editor.body_cursor], "ca");
+        edit_key(
+            &mut editor,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        );
+        edit_key(
+            &mut editor,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+
+        assert_eq!(editor.body, "afé\ntea\nbiscuits");
+        assert_eq!(editor.body_cursor, 0);
+    }
+
+    #[test]
+    fn home_end_and_enter_edit_the_active_line() {
+        let mut editor = post_editor();
+        editor.field = EditorField::Body;
+        editor.body_cursor = "First line\nSec".len();
+
+        edit_key(
+            &mut editor,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        );
+        edit_key(
+            &mut editor,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        edit_key(&mut editor, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        edit_key(
+            &mut editor,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(editor.body, "First line\n\nSecond line!");
     }
 }

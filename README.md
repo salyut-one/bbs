@@ -59,13 +59,13 @@ cargo run --bin salyut-bbs-web
 ```
 
 Use `[` and `]` to change boards, `j`/`k` to move, Enter to read, and
-`n`/`e`/`d` to create, edit, or delete. Writing opens `$EDITOR`, falling back
-to `vi` when it is unset; save and close the editor to submit. Press `v` while
-reading a proposal to vote. While reading, `a` writes a reply, `u` updates the
-selected reply, `d` deletes it, and `l` locks or unlocks the thread for members
-of `wheel`. Proposal authors press `w` to withdraw while voting is open.
-Members of `wheel` press `x` to record a veto or `i` to record implementation
-after a proposal has been accepted.
+`n`/`e`/`d` to create, edit, or delete. The editor has a visible cursor; use
+the arrow keys and Home/End to move, Tab to switch between title and body, and
+Ctrl-S to save. Press `v` while reading a proposal to vote. While reading, `a`
+writes a reply, `u` updates the selected reply, `d` deletes it, and `l` locks
+or unlocks the thread for members of `wheel`. Proposal authors press `w` to
+withdraw while voting is open. Members of `wheel` press `x` to record a veto
+or `i` to record implementation after a proposal has been accepted.
 
 ## Fedora 44
 
