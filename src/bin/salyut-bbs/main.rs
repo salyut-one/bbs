@@ -17,6 +17,9 @@ use salyut_bbs::{
 
 mod ui;
 
+const TITLE_MARKER: &str = "# Title goes below this line";
+const BODY_MARKER: &str = "# Post body goes below this line";
+
 #[derive(Parser)]
 #[command(version, about = "salyut.one BBS client")]
 struct Arguments {
@@ -90,14 +93,49 @@ impl Draft {
         }
     }
 
+    fn contents(&self) -> String {
+        if self.target.needs_title() {
+            format!(
+                "{TITLE_MARKER}\n{}\n{BODY_MARKER}\n{}\n",
+                self.title, self.body
+            )
+        } else {
+            format!("{BODY_MARKER}\n{}\n", self.body)
+        }
+    }
+
+    fn apply(&mut self, contents: &str) -> Result<()> {
+        let contents = contents
+            .strip_prefix(if self.target.needs_title() {
+                TITLE_MARKER
+            } else {
+                BODY_MARKER
+            })
+            .context("draft instructions are missing or were changed")?
+            .strip_prefix('\n')
+            .context("draft instructions must be followed by a newline")?;
+
+        if self.target.needs_title() {
+            let separator = format!("\n{BODY_MARKER}\n");
+            let (title, body) = contents
+                .split_once(&separator)
+                .context("post body instruction is missing or was changed")?;
+            let title = title.trim();
+            if title.contains('\n') {
+                bail!("title must be a single line");
+            }
+            self.title = title.to_owned();
+            self.body = body.trim_end().to_owned();
+        } else {
+            self.body = contents.trim_end().to_owned();
+        }
+        Ok(())
+    }
+
     fn edit(&mut self) -> Result<bool> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path = env::temp_dir().join(format!("salyut-bbs-draft-{}-{nonce}.txt", process::id()));
-        let initial = if self.target.needs_title() {
-            format!("{}\n\n{}", self.title, self.body)
-        } else {
-            self.body.clone()
-        };
+        let initial = self.contents();
         let result = (|| {
             use io::Write;
             let mut file = fs::OpenOptions::new()
@@ -120,15 +158,7 @@ impl Draft {
             if contents.trim_end() == initial.trim_end() {
                 return Ok(false);
             }
-            if self.target.needs_title() {
-                let (title, body) = contents
-                    .split_once("\n\n")
-                    .context("put a blank line between the title and body")?;
-                self.title = title.trim().to_owned();
-                self.body = body.trim_end().to_owned();
-            } else {
-                self.body = contents.trim_end().to_owned();
-            }
+            self.apply(&contents)?;
             Ok(true)
         })();
         let _ = fs::remove_file(path);
@@ -666,5 +696,72 @@ impl App {
             }
             Err(error) => self.message = error.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_draft_uses_labelled_title_and_body_sections() {
+        let draft = Draft::new(
+            EditorTarget::NewPost,
+            "general".to_owned(),
+            "Creative title".to_owned(),
+            "Lorem ipsum dolor sit amet...".to_owned(),
+            false,
+        );
+
+        assert_eq!(
+            draft.contents(),
+            "# Title goes below this line\n\
+             Creative title\n\
+             # Post body goes below this line\n\
+             Lorem ipsum dolor sit amet...\n"
+        );
+    }
+
+    #[test]
+    fn post_draft_parser_removes_instruction_lines() {
+        let mut draft = Draft::new(
+            EditorTarget::NewPost,
+            "general".to_owned(),
+            String::new(),
+            String::new(),
+            false,
+        );
+
+        draft
+            .apply(
+                "# Title goes below this line\n\
+                 A better title\n\
+                 # Post body goes below this line\n\
+                 First paragraph.\n\nSecond paragraph.\n",
+            )
+            .unwrap();
+
+        assert_eq!(draft.title, "A better title");
+        assert_eq!(draft.body, "First paragraph.\n\nSecond paragraph.");
+    }
+
+    #[test]
+    fn body_only_drafts_use_the_body_instruction() {
+        let mut draft = Draft::new(
+            EditorTarget::NewReply(1),
+            "general".to_owned(),
+            String::new(),
+            "Original reply".to_owned(),
+            false,
+        );
+
+        assert_eq!(
+            draft.contents(),
+            "# Post body goes below this line\nOriginal reply\n"
+        );
+        draft
+            .apply("# Post body goes below this line\nEdited reply\n")
+            .unwrap();
+        assert_eq!(draft.body, "Edited reply");
     }
 }

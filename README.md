@@ -63,8 +63,9 @@ cargo run --bin salyut-bbs
 
 Use `[` and `]` to change boards, `j`/`k` to move, Enter to read, and
 `n`/`e`/`d` to create, edit, or delete. Drafts open in `$VISUAL`, then
-`$EDITOR`, falling back to `vi`; post drafts use the first line as the title
-and a blank line before the body. Press `v` while reading a proposal to vote.
+`$EDITOR`, falling back to `vi`. Post drafts keep the title and body in one
+file, below their labelled instruction lines. Press `v` while reading a
+proposal to vote.
 While reading, `a` writes a reply, `u` updates the selected reply, `d` deletes
 it, and `l` locks or unlocks the thread for members of `wheel`. Proposal
 authors press `w` to withdraw while voting is open. Members of `wheel` press
