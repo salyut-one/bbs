@@ -8,47 +8,38 @@ permissions:
   contents: read
 
 jobs:
-  rust:
-    name: Rust checks (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - macos-latest
+  macos:
+    name: macOS checks
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v6
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
-      - name: Check formatting
-        run: cargo +stable fmt --all -- --check
-      - name: Run Clippy
-        run: cargo +stable clippy --locked --all-targets -- -D warnings
-      - name: Run tests
-        run: cargo +stable test --locked --all-targets
+      - name: Check
+        run: make check CARGO="cargo +stable"
 
   fedora:
-    name: Fedora 44 build and test
+    name: Fedora 44 build and install
     runs-on: ubuntu-latest
     container: fedora:44
 
     steps:
       - uses: actions/checkout@v6
       - name: Install build tools
-        run: dnf install -y cargo rust gcc systemd
-      - name: Build
-        run: cargo build --locked --all-targets
-      - name: Test
-        run: cargo test --locked --all-targets
-      - name: Check systemd units
+        run: dnf install -y cargo gcc git make rust shadow-utils systemd
+      - name: Build and test
+        run: |
+          make build
+          make test
+      - name: Install and check systemd unit
         run: |
           groupadd --system salyut-bbs
-          groupadd --system salyut-bbs-web
-          useradd --system --gid salyut-bbs salyut-bbsd
-          useradd --system --gid salyut-bbs-web salyut-web
-          install -m 0755 target/debug/salyut-bbsd /usr/local/bin/
-          install -m 0755 target/debug/salyut-bbs-web /usr/local/bin/
-          install -m 0644 etc/tmpfiles.d/salyut-bbs.conf /etc/tmpfiles.d/
+          useradd --system --gid salyut-bbs \
+            --home-dir /var/lib/salyut-bbs --shell /usr/sbin/nologin salyut-bbsd
+          make install
           systemd-tmpfiles --create /etc/tmpfiles.d/salyut-bbs.conf
-          systemd-analyze verify etc/systemd/system/*.service
+          systemd-analyze verify /etc/systemd/system/salyut-bbsd.service
+          test -x /usr/local/bin/salyut-bbs
+          test -x /usr/local/bin/salyut-bbsd
+          test -L /usr/local/bin/bbs
