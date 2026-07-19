@@ -1,8 +1,14 @@
-use std::{io, path::PathBuf, time::Duration};
+use std::{
+    env, fs, io,
+    os::unix::fs::OpenOptionsExt,
+    path::PathBuf,
+    process::{self, Command},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use salyut_bbs::{
     client::Client,
@@ -21,7 +27,6 @@ struct Arguments {
 enum Mode {
     Browse,
     View,
-    Edit(Editor),
     Vote(usize),
     Confirm(ConfirmAction, bool),
 }
@@ -34,15 +39,12 @@ enum ConfirmAction {
     WithdrawProposal,
 }
 
-struct Editor {
+struct Draft {
     target: EditorTarget,
     board_slug: String,
     title: String,
     body: String,
     creates_proposal: bool,
-    field: EditorField,
-    title_cursor: usize,
-    body_cursor: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -56,10 +58,6 @@ enum EditorTarget {
 }
 
 impl EditorTarget {
-    fn is_reply(&self) -> bool {
-        matches!(self, Self::NewReply(_) | Self::EditReply { .. })
-    }
-
     fn returns_to_view(&self) -> bool {
         matches!(
             self,
@@ -70,18 +68,12 @@ impl EditorTarget {
         )
     }
 
-    fn is_note(&self) -> bool {
-        matches!(self, Self::VetoProposal(_) | Self::ImplementProposal(_))
+    fn needs_title(self) -> bool {
+        matches!(self, Self::NewPost | Self::EditPost(_))
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EditorField {
-    Title,
-    Body,
-}
-
-impl Editor {
+impl Draft {
     fn new(
         target: EditorTarget,
         board_slug: String,
@@ -89,30 +81,64 @@ impl Editor {
         body: String,
         creates_proposal: bool,
     ) -> Self {
-        let field = if target.is_reply() || target.is_note() {
-            EditorField::Body
-        } else {
-            EditorField::Title
-        };
-        let title_cursor = title.len();
-        let body_cursor = body.len();
         Self {
             target,
             board_slug,
             title,
             body,
             creates_proposal,
-            field,
-            title_cursor,
-            body_cursor,
         }
+    }
+
+    fn edit(&mut self) -> Result<bool> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = env::temp_dir().join(format!("salyut-bbs-draft-{}-{nonce}.txt", process::id()));
+        let initial = if self.target.needs_title() {
+            format!("{}\n\n{}", self.title, self.body)
+        } else {
+            self.body.clone()
+        };
+        let result = (|| {
+            use io::Write;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("create draft {}", path.display()))?;
+            file.write_all(initial.as_bytes())?;
+            drop(file);
+            let status = Command::new("sh")
+                .args(["-c", r#"${VISUAL:-${EDITOR:-vi}} "$1""#, "salyut-bbs"])
+                .arg(&path)
+                .status()
+                .context("start editor")?;
+            if !status.success() {
+                return Ok(false);
+            }
+            let contents = fs::read_to_string(&path)?;
+            if contents.trim_end() == initial.trim_end() {
+                return Ok(false);
+            }
+            if self.target.needs_title() {
+                let (title, body) = contents
+                    .split_once("\n\n")
+                    .context("put a blank line between the title and body")?;
+                self.title = title.trim().to_owned();
+                self.body = body.trim_end().to_owned();
+            } else {
+                self.body = contents.trim_end().to_owned();
+            }
+            Ok(true)
+        })();
+        let _ = fs::remove_file(path);
+        result
     }
 }
 
 struct App {
     client: Client,
     handle: String,
-    groups: Vec<String>,
     boards: Vec<Board>,
     board_selected: usize,
     posts: Vec<PostSummary>,
@@ -127,15 +153,14 @@ struct App {
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
     let client = Client::new(arguments.socket);
-    let identity = client.identity()?;
+    let handle = client.handle()?;
     let boards = client.boards()?;
     if boards.is_empty() {
         bail!("daemon returned no boards");
     }
     let mut app = App {
         client,
-        handle: identity.handle,
-        groups: identity.groups,
+        handle,
         boards,
         board_selected: 0,
         posts: Vec::new(),
@@ -148,23 +173,13 @@ fn main() -> Result<()> {
     };
     app.refresh();
 
-    crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    crossterm::execute!(
-        stdout,
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::cursor::Hide
-    )?;
+    let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    resume(&mut terminal)?;
     let result = run(&mut terminal, &mut app);
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(
-        terminal.backend_mut(),
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::cursor::Show
-    )?;
-    result
+    let cleanup = suspend(&mut terminal);
+    result.and(cleanup)
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
@@ -174,17 +189,42 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             && let Event::Key(key) = event::read()?
             && key.kind == crossterm::event::KeyEventKind::Press
         {
-            handle_key(app, key);
+            handle_key(terminal, app, key)?;
         }
     }
     Ok(())
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) {
+fn resume(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::cursor::Hide
+    )?;
+    terminal.clear()?;
+    Ok(())
+}
+
+fn suspend(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    crossterm::terminal::disable_raw_mode()?;
+    crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
+    Ok(())
+}
+
+fn handle_key(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    key: KeyEvent,
+) -> Result<()> {
     let mode = std::mem::replace(&mut app.mode, Mode::Browse);
     app.mode = match mode {
-        Mode::Browse => handle_browse_key(app, key),
-        Mode::View => handle_view_key(app, key),
+        Mode::Browse => handle_browse_key(terminal, app, key)?,
+        Mode::View => handle_view_key(terminal, app, key)?,
         Mode::Vote(mut selected) => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => Mode::View,
             KeyCode::Down | KeyCode::Char('j') => {
@@ -226,70 +266,45 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Esc | KeyCode::Char('q') => confirmation_destination(action),
             _ => Mode::Confirm(action, yes),
         },
-        Mode::Edit(mut editor) => {
-            if key.code == KeyCode::Esc {
-                if editor.target.returns_to_view() {
-                    Mode::View
-                } else {
-                    Mode::Browse
-                }
-            } else if key.code == KeyCode::Char('s')
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-            {
-                let returns_to_view = editor.target.returns_to_view();
-                if app.save(&editor) {
-                    if returns_to_view {
-                        Mode::View
-                    } else {
-                        Mode::Browse
-                    }
-                } else {
-                    Mode::Edit(editor)
-                }
-            } else {
-                edit_key(&mut editor, key);
-                Mode::Edit(editor)
-            }
-        }
     };
+    Ok(())
 }
 
-fn handle_browse_key(app: &mut App, key: KeyEvent) -> Mode {
+fn handle_browse_key(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    key: KeyEvent,
+) -> Result<Mode> {
     match key.code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Right | KeyCode::Char(']') | KeyCode::Tab => app.next_board(),
         KeyCode::Left | KeyCode::Char('[') | KeyCode::BackTab => app.previous_board(),
         KeyCode::Char('n') => {
-            if !app.can_write_current_board() {
-                app.message = app.write_denied_message();
-            } else {
-                let board = app.current_board();
-                return Mode::Edit(Editor::new(
+            let board = app.current_board();
+            app.edit(
+                terminal,
+                Draft::new(
                     EditorTarget::NewPost,
                     board.slug.clone(),
                     String::new(),
                     String::new(),
                     board.kind == BoardKind::Polls,
-                ));
-            }
+                ),
+            )?;
         }
         KeyCode::Char('e') => {
             if let Some(post) = app.load_selected() {
-                if post.proposal.is_some() {
-                    app.message = "Proposals cannot be edited after voting begins".to_owned();
-                    return Mode::Browse;
-                }
-                if post.author == app.handle {
-                    return Mode::Edit(Editor::new(
+                app.edit(
+                    terminal,
+                    Draft::new(
                         EditorTarget::EditPost(post.id),
                         post.board.slug,
                         post.title,
                         post.body,
                         false,
-                    ));
-                }
-                app.message = "You can only edit your own posts".to_owned();
+                    ),
+                )?;
             }
         }
         KeyCode::Char('d') => {
@@ -299,7 +314,7 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> Mode {
             {
                 app.message = "Open a proposal and press w to withdraw it".to_owned();
             } else if app.selected_post().is_some() {
-                return Mode::Confirm(ConfirmAction::DeletePost, false);
+                return Ok(Mode::Confirm(ConfirmAction::DeletePost, false));
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -314,16 +329,20 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> Mode {
             if let Some(post) = app.load_selected() {
                 app.viewed = Some(post);
                 app.reply_selected = 0;
-                return Mode::View;
+                return Ok(Mode::View);
             }
         }
         _ => {}
     }
-    Mode::Browse
+    Ok(Mode::Browse)
 }
 
-fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
-    match key.code {
+fn handle_view_key(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    key: KeyEvent,
+) -> Result<Mode> {
+    Ok(match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => Mode::Browse,
         KeyCode::Char('v') => {
             if let Some(proposal) = app.viewed.as_ref().and_then(|post| post.proposal.as_ref())
@@ -333,7 +352,7 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
                     "Voting is closed; this proposal is {}",
                     proposal.state.label()
                 );
-                return Mode::View;
+                return Ok(Mode::View);
             }
             if app.viewed.as_ref().is_some_and(|post| {
                 post.proposal
@@ -351,38 +370,32 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
             }
         }
         KeyCode::Char('e') => {
-            if let Some(post) = &app.viewed
-                && post.author == app.handle
-            {
-                if post.proposal.is_some() {
-                    app.message = "Proposals cannot be edited after voting begins".to_owned();
-                    return Mode::View;
-                }
-                Mode::Edit(Editor::new(
-                    EditorTarget::EditPost(post.id),
-                    post.board.slug.clone(),
-                    post.title.clone(),
-                    post.body.clone(),
-                    false,
-                ))
-            } else {
-                app.message = "You can only edit your own posts".to_owned();
-                Mode::View
+            if let Some(post) = &app.viewed {
+                app.edit(
+                    terminal,
+                    Draft::new(
+                        EditorTarget::EditPost(post.id),
+                        post.board.slug.clone(),
+                        post.title.clone(),
+                        post.body.clone(),
+                        false,
+                    ),
+                )?;
             }
+            Mode::View
         }
         KeyCode::Char('a') => {
             if let Some(post) = &app.viewed {
-                if post.locked {
-                    app.message = "This post is locked".to_owned();
-                    return Mode::View;
-                }
-                return Mode::Edit(Editor::new(
-                    EditorTarget::NewReply(post.id),
-                    post.board.slug.clone(),
-                    String::new(),
-                    String::new(),
-                    false,
-                ));
+                app.edit(
+                    terminal,
+                    Draft::new(
+                        EditorTarget::NewReply(post.id),
+                        post.board.slug.clone(),
+                        String::new(),
+                        String::new(),
+                        false,
+                    ),
+                )?;
             }
             Mode::View
         }
@@ -400,23 +413,23 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
         }
         KeyCode::Char('u') => {
             let Some(post) = &app.viewed else {
-                return Mode::View;
+                return Ok(Mode::View);
             };
             let Some(reply) = post.replies.get(app.reply_selected) else {
                 app.message = "There is no reply selected".to_owned();
-                return Mode::View;
+                return Ok(Mode::View);
             };
-            if reply.author != app.handle {
-                app.message = "You can only edit your own replies".to_owned();
-                return Mode::View;
-            }
-            Mode::Edit(Editor::new(
-                EditorTarget::EditReply { id: reply.id },
-                post.board.slug.clone(),
-                String::new(),
-                reply.body.clone(),
-                false,
-            ))
+            app.edit(
+                terminal,
+                Draft::new(
+                    EditorTarget::EditReply { id: reply.id },
+                    post.board.slug.clone(),
+                    String::new(),
+                    reply.body.clone(),
+                    false,
+                ),
+            )?;
+            Mode::View
         }
         KeyCode::Char('d') => {
             let Some(reply) = app
@@ -425,67 +438,45 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> Mode {
                 .and_then(|post| post.replies.get(app.reply_selected))
             else {
                 app.message = "There is no reply selected".to_owned();
-                return Mode::View;
+                return Ok(Mode::View);
             };
-            if reply.author != app.handle {
-                app.message = "You can only delete your own replies".to_owned();
-                return Mode::View;
-            }
             Mode::Confirm(ConfirmAction::DeleteReply(reply.id), false)
         }
         KeyCode::Char('l') => {
-            if !app.groups.iter().any(|group| group == "wheel") {
-                app.message = "Locking posts requires Unix group wheel".to_owned();
-                return Mode::View;
-            }
             let Some(post) = &app.viewed else {
-                return Mode::View;
+                return Ok(Mode::View);
             };
             Mode::Confirm(ConfirmAction::SetLocked(!post.locked), false)
         }
         KeyCode::Char('w') => {
-            let Some(post) = &app.viewed else {
-                return Mode::View;
-            };
-            if post.author != app.handle
-                || post.proposal.as_ref().map(|proposal| proposal.state)
-                    != Some(ProposalState::Voting)
-            {
-                app.message =
-                    "Only the author may withdraw a proposal while voting is open".to_owned();
-                return Mode::View;
+            if app.viewed.is_none() {
+                return Ok(Mode::View);
             }
             Mode::Confirm(ConfirmAction::WithdrawProposal, false)
         }
         KeyCode::Char('x') | KeyCode::Char('i') => {
-            if !app.groups.iter().any(|group| group == "wheel") {
-                app.message = "This proposal action requires Unix group wheel".to_owned();
-                return Mode::View;
-            }
             let Some(post) = &app.viewed else {
-                return Mode::View;
+                return Ok(Mode::View);
             };
-            if post.proposal.as_ref().map(|proposal| proposal.state)
-                != Some(ProposalState::Accepted)
-            {
-                app.message = "Only accepted proposals can be vetoed or implemented".to_owned();
-                return Mode::View;
-            }
             let target = if key.code == KeyCode::Char('x') {
                 EditorTarget::VetoProposal(post.id)
             } else {
                 EditorTarget::ImplementProposal(post.id)
             };
-            Mode::Edit(Editor::new(
-                target,
-                post.board.slug.clone(),
-                String::new(),
-                String::new(),
-                false,
-            ))
+            app.edit(
+                terminal,
+                Draft::new(
+                    target,
+                    post.board.slug.clone(),
+                    String::new(),
+                    String::new(),
+                    false,
+                ),
+            )?;
+            Mode::View
         }
         _ => Mode::View,
-    }
+    })
 }
 
 fn confirmation_destination(action: ConfirmAction) -> Mode {
@@ -497,136 +488,9 @@ fn confirmation_destination(action: ConfirmAction) -> Mode {
     }
 }
 
-fn edit_key(editor: &mut Editor, key: KeyEvent) {
-    if (editor.target.is_reply() || editor.target.is_note())
-        && matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
-    {
-        return;
-    }
-    if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-        editor.field = match editor.field {
-            EditorField::Title => EditorField::Body,
-            EditorField::Body => EditorField::Title,
-        };
-        return;
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
-    {
-        return;
-    }
-
-    let field = editor.field;
-    let (value, cursor) = active_value_and_cursor(editor);
-    *cursor = (*cursor).min(value.len());
-    match key.code {
-        KeyCode::Left => *cursor = previous_char_boundary(value, *cursor),
-        KeyCode::Right => *cursor = next_char_boundary(value, *cursor),
-        KeyCode::Home => *cursor = line_start(value, *cursor),
-        KeyCode::End => *cursor = line_end(value, *cursor),
-        KeyCode::Up => *cursor = vertical_cursor(value, *cursor, -1),
-        KeyCode::Down => *cursor = vertical_cursor(value, *cursor, 1),
-        KeyCode::Backspace if *cursor > 0 => {
-            let previous = previous_char_boundary(value, *cursor);
-            value.replace_range(previous..*cursor, "");
-            *cursor = previous;
-        }
-        KeyCode::Delete if *cursor < value.len() => {
-            let next = next_char_boundary(value, *cursor);
-            value.replace_range(*cursor..next, "");
-        }
-        KeyCode::Enter if field == EditorField::Body => {
-            value.insert(*cursor, '\n');
-            *cursor += 1;
-        }
-        KeyCode::Char(character) => {
-            value.insert(*cursor, character);
-            *cursor += character.len_utf8();
-        }
-        _ => {}
-    }
-}
-
-fn active_value_and_cursor(editor: &mut Editor) -> (&mut String, &mut usize) {
-    match editor.field {
-        EditorField::Title => (&mut editor.title, &mut editor.title_cursor),
-        EditorField::Body => (&mut editor.body, &mut editor.body_cursor),
-    }
-}
-
-fn previous_char_boundary(value: &str, cursor: usize) -> usize {
-    value[..cursor]
-        .char_indices()
-        .next_back()
-        .map_or(0, |(index, _)| index)
-}
-
-fn next_char_boundary(value: &str, cursor: usize) -> usize {
-    value[cursor..]
-        .chars()
-        .next()
-        .map_or(value.len(), |character| cursor + character.len_utf8())
-}
-
-fn line_start(value: &str, cursor: usize) -> usize {
-    value[..cursor].rfind('\n').map_or(0, |index| index + 1)
-}
-
-fn line_end(value: &str, cursor: usize) -> usize {
-    value[cursor..]
-        .find('\n')
-        .map_or(value.len(), |index| cursor + index)
-}
-
-fn vertical_cursor(value: &str, cursor: usize, direction: i8) -> usize {
-    let current_start = line_start(value, cursor);
-    let column = value[current_start..cursor].chars().count();
-    let (target_start, target_end) = if direction < 0 {
-        if current_start == 0 {
-            return cursor;
-        }
-        let target_end = current_start - 1;
-        let target_start = line_start(value, target_end);
-        (target_start, target_end)
-    } else {
-        let current_end = line_end(value, cursor);
-        if current_end == value.len() {
-            return cursor;
-        }
-        let target_start = current_end + 1;
-        let target_end = line_end(value, target_start);
-        (target_start, target_end)
-    };
-    byte_at_column(&value[target_start..target_end], column) + target_start
-}
-
-fn byte_at_column(line: &str, column: usize) -> usize {
-    line.char_indices()
-        .nth(column)
-        .map_or(line.len(), |(index, _)| index)
-}
-
 impl App {
     fn current_board(&self) -> &Board {
         &self.boards[self.board_selected]
-    }
-
-    fn can_write_current_board(&self) -> bool {
-        self.current_board()
-            .write_group
-            .as_ref()
-            .is_none_or(|group| self.groups.iter().any(|candidate| candidate == group))
-    }
-
-    fn write_denied_message(&self) -> String {
-        self.current_board().write_group.as_ref().map_or_else(
-            || format!("You cannot write to {}", self.current_board().name),
-            |group| {
-                format!(
-                    "Writing to {} requires Unix group {group}",
-                    self.current_board().name
-                )
-            },
-        )
     }
 
     fn next_board(&mut self) {
@@ -675,29 +539,40 @@ impl App {
         }
     }
 
-    fn save(&mut self, editor: &Editor) -> bool {
-        let result = match editor.target {
-            EditorTarget::EditPost(id) => self.client.update_post(id, &editor.title, &editor.body),
-            EditorTarget::NewReply(post_id) => self.client.create_reply(post_id, &editor.body),
-            EditorTarget::EditReply { id } => self.client.update_reply(id, &editor.body),
-            EditorTarget::NewPost if editor.creates_proposal => {
+    fn edit(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        mut draft: Draft,
+    ) -> Result<()> {
+        suspend(terminal)?;
+        let edited = draft.edit();
+        resume(terminal)?;
+        if !edited? {
+            self.message = "Edit cancelled".to_owned();
+            return Ok(());
+        }
+        let result = match draft.target {
+            EditorTarget::EditPost(id) => self.client.update_post(id, &draft.title, &draft.body),
+            EditorTarget::NewReply(post_id) => self.client.create_reply(post_id, &draft.body),
+            EditorTarget::EditReply { id } => self.client.update_reply(id, &draft.body),
+            EditorTarget::NewPost if draft.creates_proposal => {
                 self.client
-                    .create_proposal(&editor.board_slug, &editor.title, &editor.body)
+                    .create_proposal(&draft.board_slug, &draft.title, &draft.body)
             }
-            EditorTarget::VetoProposal(id) => self.client.veto_proposal(id, &editor.body),
+            EditorTarget::VetoProposal(id) => self.client.veto_proposal(id, &draft.body),
             EditorTarget::ImplementProposal(id) => {
-                self.client.mark_proposal_implemented(id, &editor.body)
+                self.client.mark_proposal_implemented(id, &draft.body)
             }
             EditorTarget::NewPost => {
                 self.client
-                    .create_post(&editor.board_slug, &editor.title, &editor.body)
+                    .create_post(&draft.board_slug, &draft.title, &draft.body)
             }
         };
         match result {
             Ok(post) => {
-                self.message = match editor.target {
+                self.message = match draft.target {
                     EditorTarget::EditPost(_) => "Post updated",
-                    EditorTarget::NewPost if editor.creates_proposal => "Proposal created",
+                    EditorTarget::NewPost if draft.creates_proposal => "Proposal created",
                     EditorTarget::NewPost => "Post created",
                     EditorTarget::NewReply(_) => "Reply posted",
                     EditorTarget::EditReply { .. } => "Reply updated",
@@ -705,18 +580,15 @@ impl App {
                     EditorTarget::ImplementProposal(_) => "Proposal marked implemented",
                 }
                 .to_owned();
-                if editor.target.returns_to_view() {
+                if draft.target.returns_to_view() {
                     self.viewed = Some(post);
                 } else {
                     self.refresh();
                 }
-                true
             }
-            Err(error) => {
-                self.message = error.to_string();
-                false
-            }
+            Err(error) => self.message = error.to_string(),
         }
+        Ok(())
     }
 
     fn delete_reply(&mut self, id: i64) {
@@ -794,83 +666,5 @@ impl App {
             }
             Err(error) => self.message = error.to_string(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn post_editor() -> Editor {
-        Editor::new(
-            EditorTarget::NewPost,
-            "general".to_owned(),
-            "Tea tiem".to_owned(),
-            "First line\nSecond line".to_owned(),
-            false,
-        )
-    }
-
-    #[test]
-    fn inserts_and_deletes_at_the_cursor() {
-        let mut editor = post_editor();
-        editor.title_cursor = "Tea ti".len();
-        edit_key(
-            &mut editor,
-            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
-        );
-        edit_key(&mut editor, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        edit_key(
-            &mut editor,
-            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
-        );
-
-        assert_eq!(editor.title, "Tea time");
-        assert_eq!(editor.title_cursor, "Tea time".len());
-    }
-
-    #[test]
-    fn moves_across_lines_and_preserves_utf8_boundaries() {
-        let mut editor = post_editor();
-        editor.body = "café\ntea\nbiscuits".to_owned();
-        editor.body_cursor = "café\nte".len();
-        editor.field = EditorField::Body;
-
-        edit_key(&mut editor, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(&editor.body[..editor.body_cursor], "ca");
-        edit_key(
-            &mut editor,
-            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
-        );
-        edit_key(
-            &mut editor,
-            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
-        );
-
-        assert_eq!(editor.body, "afé\ntea\nbiscuits");
-        assert_eq!(editor.body_cursor, 0);
-    }
-
-    #[test]
-    fn home_end_and_enter_edit_the_active_line() {
-        let mut editor = post_editor();
-        editor.field = EditorField::Body;
-        editor.body_cursor = "First line\nSec".len();
-
-        edit_key(
-            &mut editor,
-            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
-        );
-        edit_key(
-            &mut editor,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        );
-        edit_key(&mut editor, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        edit_key(
-            &mut editor,
-            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
-        );
-
-        assert_eq!(editor.body, "First line\n\nSecond line!");
     }
 }

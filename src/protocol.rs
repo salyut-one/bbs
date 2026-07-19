@@ -200,32 +200,13 @@ pub struct PostSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", content = "data", rename_all = "snake_case")]
 pub enum Response {
-    Identity {
-        uid: u32,
-        handle: String,
-        groups: Vec<String>,
-    },
+    Identity { handle: String },
     Boards(Vec<Board>),
     Posts(Vec<PostSummary>),
-    Post(Post),
-    Created(Post),
-    Updated(Post),
-    Voted(Post),
-    Replied(Post),
-    ReplyUpdated(Post),
-    ReplyDeleted {
-        id: i64,
-        post_id: i64,
-    },
-    LockChanged(Post),
-    ProposalChanged(Post),
-    Deleted {
-        id: i64,
-    },
-    Error {
-        code: ErrorCode,
-        message: String,
-    },
+    Post(Box<Post>),
+    ReplyDeleted { id: i64, post_id: i64 },
+    Deleted { id: i64 },
+    Error { code: ErrorCode, message: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

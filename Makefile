@@ -28,13 +28,9 @@ install:
 	$(LN) -sfn salyut-bbs "$(DESTDIR)$(PREFIX)/bin/bbs"
 	$(INSTALL) -m 0755 target/release/salyut-bbsd \
 		"$(DESTDIR)$(PREFIX)/bin/salyut-bbsd"
-	$(INSTALL) -m 0755 target/release/salyut-bbs-web \
-		"$(DESTDIR)$(PREFIX)/bin/salyut-bbs-web"
 	$(INSTALL) -d "$(DESTDIR)$(SYSTEMD_UNIT_DIR)"
 	$(INSTALL) -m 0644 etc/systemd/system/salyut-bbsd.service \
 		"$(DESTDIR)$(SYSTEMD_UNIT_DIR)/salyut-bbsd.service"
-	$(INSTALL) -m 0644 etc/systemd/system/salyut-bbs-web.service \
-		"$(DESTDIR)$(SYSTEMD_UNIT_DIR)/salyut-bbs-web.service"
 	$(INSTALL) -d "$(DESTDIR)$(TMPFILESDIR)"
 	$(INSTALL) -m 0644 etc/tmpfiles.d/salyut-bbs.conf \
 		"$(DESTDIR)$(TMPFILESDIR)/salyut-bbs.conf"

@@ -3,11 +3,16 @@
 The message board for [salyut.one](https://salyut.one), an all-purpose, small,
 tilde-adjacent pubnix running Fedora 44.
 
-There are three processes:
+There are two BBS processes:
 
 - `salyut-bbsd` owns the database and checks Unix credentials.
 - `salyut-bbs` is the terminal client, installed with the shorter `bbs` alias.
-- `salyut-bbs-web` serves a read-only HTML view on `127.0.0.1:8080`.
+
+The read-only web view lives in
+[`salyut-site`](https://github.com/salyut-one/site) at `/bbs`. It uses the same
+Unix socket as the terminal client. The daemon rejects mutating requests from
+the `salyut-web` Unix identity, so the web process remains read-only even
+though the socket is shared.
 
 The daemon creates three boards on first start:
 
@@ -54,57 +59,53 @@ cargo run --bin salyut-bbsd
 # terminal 2
 cargo run --bin salyut-bbs
 
-# optional, terminal 3
-cargo run --bin salyut-bbs-web
 ```
 
 Use `[` and `]` to change boards, `j`/`k` to move, Enter to read, and
-`n`/`e`/`d` to create, edit, or delete. The editor has a visible cursor; use
-the arrow keys and Home/End to move, Tab to switch between title and body, and
-Ctrl-S to save. Press `v` while reading a proposal to vote. While reading, `a`
-writes a reply, `u` updates the selected reply, `d` deletes it, and `l` locks
-or unlocks the thread for members of `wheel`. Proposal authors press `w` to
-withdraw while voting is open. Members of `wheel` press `x` to record a veto
-or `i` to record implementation after a proposal has been accepted.
+`n`/`e`/`d` to create, edit, or delete. Drafts open in `$VISUAL`, then
+`$EDITOR`, falling back to `vi`; post drafts use the first line as the title
+and a blank line before the body. Press `v` while reading a proposal to vote.
+While reading, `a` writes a reply, `u` updates the selected reply, `d` deletes
+it, and `l` locks or unlocks the thread for members of `wheel`. Proposal
+authors press `w` to withdraw while voting is open. Members of `wheel` press
+`x` to record a veto or `i` to record implementation after acceptance.
 
 ## Fedora 44
 
-Build and install the three binaries, systemd units, and tmpfiles rule, then
-create the service accounts and socket groups as root:
+Build and install the two binaries, daemon unit, and tmpfiles rule, then create
+the service account and socket group as root:
 
 ```sh
 make check
 make build
 sudo make install
 groupadd --system salyut-bbs
-groupadd --system salyut-bbs-web
 useradd --system --gid salyut-bbs --home-dir /var/lib/salyut-bbs \
   --shell /usr/sbin/nologin salyut-bbsd
-useradd --system --gid salyut-bbs-web --home-dir /nonexistent \
-  --shell /usr/sbin/nologin salyut-web
 usermod --append --groups salyut-bbs alice
 ```
 
-Create the runtime directories and start both services:
+Create the runtime directories and start the daemon:
 
 ```sh
 systemd-tmpfiles --create /etc/tmpfiles.d/salyut-bbs.conf
 systemctl daemon-reload
-systemctl enable --now salyut-bbsd.service salyut-bbs-web.service
+systemctl enable --now salyut-bbsd.service
 ```
 
-Add new shell accounts to `salyut-bbs` as part of account creation. The web
-account belongs only to `salyut-bbs-web`; it cannot reach the write socket.
-The daemon stores data in `/var/lib/salyut-bbs` and sockets in
-`/run/salyut-bbs`. Put a normal TLS reverse proxy in front of port 8080.
+Add new shell accounts to `salyut-bbs` as part of account creation.
+`salyut-site` runs its `salyut-web` process with this group so it can read from
+the shared socket. The daemon stores data in `/var/lib/salyut-bbs` and its
+socket at `/run/salyut-bbs/users/salyut.sock`.
 
 ## Notes
 
 Clients send one JSON request per Unix-socket connection. The daemon gets the
 UID from the socket, resolves current group membership from the system account
-database, and never accepts a handle from the client. Titles are limited to 120
-characters and bodies to 64 KiB. Veto reasons and implementation notes are
-limited to 4 KiB.
+database, and never accepts a handle from the client. `salyut-web` is
+daemon-enforced read-only; change `--read-only-user` only if the site service
+identity changes. Titles are limited to 120 characters and bodies to 64 KiB.
+Veto reasons and implementation notes are limited to 4 KiB.
 
 Post ownership follows numeric UIDs. Don't recycle a UID while it still owns
 posts.

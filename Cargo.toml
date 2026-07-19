@@ -5,19 +5,32 @@ edition = "2024"
 license = "MIT"
 description = "A Unix-native BBS for pubnix communities"
 
+[features]
+default = ["daemon", "tui"]
+daemon = ["dep:clap", "dep:libc", "dep:rusqlite"]
+tui = ["dep:clap", "dep:crossterm", "dep:ratatui"]
+
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.29"
-libc = "0.2"
-ratatui = "0.30"
-rusqlite = { version = "0.37", features = ["bundled"] }
+clap = { version = "4.5", features = ["derive"], optional = true }
+crossterm = { version = "0.29", optional = true }
+libc = { version = "0.2", optional = true }
+ratatui = { version = "0.30", optional = true }
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tiny_http = "0.12"
+
+[[bin]]
+name = "salyut-bbs"
+path = "src/bin/salyut-bbs/main.rs"
+required-features = ["tui"]
+
+[[bin]]
+name = "salyut-bbsd"
+path = "src/bin/salyut-bbsd.rs"
+required-features = ["daemon"]
 
 [profile.release]
 lto = "thin"
 strip = true
-

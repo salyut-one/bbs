@@ -19,16 +19,6 @@ pub fn read_write_socket() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-pub fn read_only_socket() -> PathBuf {
-    runtime_directory().join("web.sock")
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn read_only_socket() -> PathBuf {
-    PathBuf::from("/run/salyut-bbs/web/salyut.sock")
-}
-
-#[cfg(target_os = "macos")]
 pub fn database() -> PathBuf {
     runtime_directory().join("posts.sqlite3")
 }
@@ -36,12 +26,4 @@ pub fn database() -> PathBuf {
 #[cfg(not(target_os = "macos"))]
 pub fn database() -> PathBuf {
     PathBuf::from("/var/lib/salyut-bbs/posts.sqlite3")
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn socket_paths_are_distinct() {
-        assert_ne!(super::read_write_socket(), super::read_only_socket());
-    }
 }

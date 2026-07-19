@@ -2,6 +2,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,11 +14,6 @@ pub struct Client {
     socket: PathBuf,
 }
 
-pub struct Identity {
-    pub handle: String,
-    pub groups: Vec<String>,
-}
-
 impl Client {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
@@ -25,13 +21,9 @@ impl Client {
         }
     }
 
-    pub fn identity(&self) -> Result<Identity> {
+    pub fn handle(&self) -> Result<String> {
         match self.call(&Request::WhoAmI)? {
-            Response::Identity {
-                uid: _,
-                handle,
-                groups,
-            } => Ok(Identity { handle, groups }),
+            Response::Identity { handle } => Ok(handle),
             response => unexpected(response),
         }
     }
@@ -56,7 +48,7 @@ impl Client {
 
     pub fn post(&self, id: i64) -> Result<Option<Post>> {
         match self.call(&Request::GetPost { id })? {
-            Response::Post(post) => Ok(Some(post)),
+            Response::Post(post) => Ok(Some(*post)),
             Response::Error {
                 code: ErrorCode::NotFound,
                 ..
@@ -66,36 +58,27 @@ impl Client {
     }
 
     pub fn create_post(&self, board: &str, title: &str, body: &str) -> Result<Post> {
-        match self.call(&Request::CreatePost {
+        post_result(self.call(&Request::CreatePost {
             board: board.to_owned(),
             title: title.to_owned(),
             body: body.to_owned(),
-        })? {
-            Response::Created(post) => Ok(post),
-            response => result_error(response),
-        }
+        })?)
     }
 
     pub fn create_proposal(&self, board: &str, title: &str, body: &str) -> Result<Post> {
-        match self.call(&Request::CreateProposal {
+        post_result(self.call(&Request::CreateProposal {
             board: board.to_owned(),
             title: title.to_owned(),
             body: body.to_owned(),
-        })? {
-            Response::Created(post) => Ok(post),
-            response => result_error(response),
-        }
+        })?)
     }
 
     pub fn update_post(&self, id: i64, title: &str, body: &str) -> Result<Post> {
-        match self.call(&Request::UpdatePost {
+        post_result(self.call(&Request::UpdatePost {
             id,
             title: title.to_owned(),
             body: body.to_owned(),
-        })? {
-            Response::Updated(post) => Ok(post),
-            response => result_error(response),
-        }
+        })?)
     }
 
     pub fn delete_post(&self, id: i64) -> Result<()> {
@@ -106,30 +89,21 @@ impl Client {
     }
 
     pub fn vote(&self, post_id: i64, option_id: i64) -> Result<Post> {
-        match self.call(&Request::CastVote { post_id, option_id })? {
-            Response::Voted(post) => Ok(post),
-            response => result_error(response),
-        }
+        post_result(self.call(&Request::CastVote { post_id, option_id })?)
     }
 
     pub fn create_reply(&self, post_id: i64, body: &str) -> Result<Post> {
-        match self.call(&Request::CreateReply {
+        post_result(self.call(&Request::CreateReply {
             post_id,
             body: body.to_owned(),
-        })? {
-            Response::Replied(post) => Ok(post),
-            response => result_error(response),
-        }
+        })?)
     }
 
     pub fn update_reply(&self, id: i64, body: &str) -> Result<Post> {
-        match self.call(&Request::UpdateReply {
+        post_result(self.call(&Request::UpdateReply {
             id,
             body: body.to_owned(),
-        })? {
-            Response::ReplyUpdated(post) => Ok(post),
-            response => result_error(response),
-        }
+        })?)
     }
 
     pub fn delete_reply(&self, id: i64) -> Result<i64> {
@@ -140,42 +114,33 @@ impl Client {
     }
 
     pub fn set_post_locked(&self, id: i64, locked: bool) -> Result<Post> {
-        match self.call(&Request::SetPostLocked { id, locked })? {
-            Response::LockChanged(post) => Ok(post),
-            response => result_error(response),
-        }
+        post_result(self.call(&Request::SetPostLocked { id, locked })?)
     }
 
     pub fn withdraw_proposal(&self, id: i64) -> Result<Post> {
-        match self.call(&Request::WithdrawProposal { id })? {
-            Response::ProposalChanged(post) => Ok(post),
-            response => result_error(response),
-        }
+        post_result(self.call(&Request::WithdrawProposal { id })?)
     }
 
     pub fn veto_proposal(&self, id: i64, reason: &str) -> Result<Post> {
-        match self.call(&Request::VetoProposal {
+        post_result(self.call(&Request::VetoProposal {
             id,
             reason: reason.to_owned(),
-        })? {
-            Response::ProposalChanged(post) => Ok(post),
-            response => result_error(response),
-        }
+        })?)
     }
 
     pub fn mark_proposal_implemented(&self, id: i64, note: &str) -> Result<Post> {
-        match self.call(&Request::MarkProposalImplemented {
+        post_result(self.call(&Request::MarkProposalImplemented {
             id,
             note: note.to_owned(),
-        })? {
-            Response::ProposalChanged(post) => Ok(post),
-            response => result_error(response),
-        }
+        })?)
     }
 
     fn call(&self, request: &Request) -> Result<Response> {
         let mut stream = UnixStream::connect(&self.socket)
             .with_context(|| format!("connect {}", self.socket.display()))?;
+        let timeout = Some(Duration::from_secs(10));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
         serde_json::to_writer(&mut stream, request)?;
         stream.write_all(b"\n")?;
 
@@ -185,6 +150,13 @@ impl Client {
             bail!("daemon closed the connection");
         }
         serde_json::from_str(&line).context("invalid response from daemon")
+    }
+}
+
+fn post_result(response: Response) -> Result<Post> {
+    match response {
+        Response::Post(post) => Ok(*post),
+        response => result_error(response),
     }
 }
 

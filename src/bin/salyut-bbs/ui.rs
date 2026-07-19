@@ -1,11 +1,11 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin, Position, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use super::{App, ConfirmAction, Editor, EditorField, Mode};
+use super::{App, ConfirmAction, Mode};
 
 pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
@@ -27,7 +27,6 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     match &app.mode {
         Mode::View => draw_post(frame, app, centered(area, 88, 84), None),
         Mode::Vote(selected) => draw_post(frame, app, centered(area, 88, 84), Some(*selected)),
-        Mode::Edit(editor) => draw_editor(frame, editor, centered(area, 90, 90)),
         Mode::Confirm(action, yes) => {
             draw_confirmation(frame, app, *action, *yes, centered(area, 54, 24))
         }
@@ -297,55 +296,11 @@ fn draw_post(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect, vote_selecte
         }
     }
     lines.push(Line::raw(""));
-    let help =
-        if vote_selected.is_some() {
-            "↑/↓: choose · Enter: vote/change vote · Esc: cancel".to_owned()
-        } else {
-            let mut commands = vec!["Esc/q: close".to_owned()];
-            if !post.locked {
-                commands.push("a: reply".to_owned());
-            }
-            if post.proposal.as_ref().is_some_and(|proposal| {
-                proposal.state == salyut_bbs::protocol::ProposalState::Voting
-            }) {
-                commands.push("v: vote".to_owned());
-            }
-            if post.author == app.handle && post.proposal.is_none() {
-                commands.push("e: edit post".to_owned());
-            }
-            if post.author == app.handle
-                && post.proposal.as_ref().is_some_and(|proposal| {
-                    proposal.state == salyut_bbs::protocol::ProposalState::Voting
-                })
-            {
-                commands.push("w: withdraw".to_owned());
-            }
-            if !post.replies.is_empty() {
-                commands.push("↑/↓: select reply".to_owned());
-                if post
-                    .replies
-                    .get(app.reply_selected)
-                    .is_some_and(|reply| reply.author == app.handle)
-                {
-                    commands.push("u: update reply".to_owned());
-                    commands.push("d: delete reply".to_owned());
-                }
-            }
-            if app.groups.iter().any(|group| group == "wheel") {
-                commands.push(if post.locked {
-                    "l: unlock".to_owned()
-                } else {
-                    "l: lock".to_owned()
-                });
-                if post.proposal.as_ref().is_some_and(|proposal| {
-                    proposal.state == salyut_bbs::protocol::ProposalState::Accepted
-                }) {
-                    commands.push("x: veto".to_owned());
-                    commands.push("i: implemented".to_owned());
-                }
-            }
-            commands.join(" · ")
-        };
+    let help = if vote_selected.is_some() {
+        "↑/↓: choose · Enter: vote/change vote · Esc: cancel"
+    } else {
+        "Esc/q: close · a: reply · v: vote · e: edit · ↑/↓: select reply · u: edit reply · d: delete reply · l: lock · w: withdraw · x: veto · i: implemented"
+    };
     lines.push(Line::styled(help, Style::default().fg(Color::Gray)));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -353,135 +308,6 @@ fn draw_post(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect, vote_selecte
             .block(Block::default().title(" post ").borders(Borders::ALL)),
         area,
     );
-}
-
-fn draw_editor(frame: &mut ratatui::Frame<'_>, editor: &Editor, area: Rect) {
-    frame.render_widget(Clear, area);
-    if editor.target.is_reply() || editor.target.is_note() {
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), Constraint::Length(3)])
-            .split(area);
-        let title = match editor.target {
-            super::EditorTarget::VetoProposal(_) => " veto reason ",
-            super::EditorTarget::ImplementProposal(_) => " implementation note ",
-            _ => " reply ",
-        };
-        draw_editor_field(
-            frame,
-            &editor.body,
-            editor.body_cursor,
-            title,
-            true,
-            sections[0],
-        );
-        frame.render_widget(
-            Paragraph::new(Text::from(vec![
-                Line::raw(format!("/{}", editor.board_slug)),
-                Line::styled(
-                    "arrows/Home/End: move · Ctrl-S: save · Esc: cancel",
-                    Style::default().fg(Color::Gray),
-                ),
-            ])),
-            sections[1],
-        );
-        return;
-    }
-
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-        ])
-        .split(area);
-    draw_editor_field(
-        frame,
-        &editor.title,
-        editor.title_cursor,
-        " title ",
-        editor.field == EditorField::Title,
-        sections[0],
-    );
-    draw_editor_field(
-        frame,
-        &editor.body,
-        editor.body_cursor,
-        " body ",
-        editor.field == EditorField::Body,
-        sections[1],
-    );
-    frame.render_widget(
-        Paragraph::new(Text::from(vec![
-            Line::raw(format!("/{} · Tab: switch field", editor.board_slug)),
-            Line::styled(
-                "arrows/Home/End: move · Ctrl-S: save · Esc: cancel",
-                Style::default().fg(Color::Gray),
-            ),
-        ])),
-        sections[2],
-    );
-}
-
-fn draw_editor_field(
-    frame: &mut ratatui::Frame<'_>,
-    value: &str,
-    cursor: usize,
-    title: &'static str,
-    selected: bool,
-    area: Rect,
-) {
-    let inner = area.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    });
-    let (scroll, cursor_position) = editor_view(value, cursor, inner);
-    frame.render_widget(
-        Paragraph::new(value)
-            .scroll(scroll)
-            .block(editor_block(title, selected)),
-        area,
-    );
-    if selected && inner.width > 0 && inner.height > 0 {
-        frame.set_cursor_position(cursor_position);
-    }
-}
-
-fn editor_view(value: &str, cursor: usize, area: Rect) -> ((u16, u16), Position) {
-    let cursor = cursor.min(value.len());
-    let line_start = value[..cursor].rfind('\n').map_or(0, |index| index + 1);
-    let line = value[..cursor]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
-        .count();
-    let column = Line::raw(&value[line_start..cursor]).width();
-    let vertical_scroll = line.saturating_sub(usize::from(area.height.saturating_sub(1)));
-    let horizontal_scroll = column.saturating_sub(usize::from(area.width.saturating_sub(1)));
-    let x = area
-        .x
-        .saturating_add((column - horizontal_scroll).min(usize::from(u16::MAX)) as u16);
-    let y = area
-        .y
-        .saturating_add((line - vertical_scroll).min(usize::from(u16::MAX)) as u16);
-    (
-        (
-            vertical_scroll.min(usize::from(u16::MAX)) as u16,
-            horizontal_scroll.min(usize::from(u16::MAX)) as u16,
-        ),
-        Position::new(x, y),
-    )
-}
-
-fn editor_block(title: &'static str, selected: bool) -> Block<'static> {
-    Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(if selected {
-            Style::default().fg(Color::Gray)
-        } else {
-            Style::default()
-        })
 }
 
 fn draw_confirmation(
@@ -561,21 +387,4 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         Constraint::Percentage((100 - width) / 2),
     ])
     .split(rows[1])[1]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn editor_cursor_scrolls_into_the_visible_area() {
-        let value = "first\nsecond\nthird";
-        let cursor = "first\nsecond\nthi".len();
-        let area = Rect::new(10, 5, 3, 2);
-
-        let (scroll, position) = editor_view(value, cursor, area);
-
-        assert_eq!(scroll, (1, 1));
-        assert_eq!(position, Position::new(12, 6));
-    }
 }

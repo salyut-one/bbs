@@ -21,14 +21,12 @@ use salyut_bbs::{
 struct Arguments {
     #[arg(long, default_value_os_t = salyut_bbs::paths::read_write_socket())]
     socket: PathBuf,
-    #[arg(long, default_value_os_t = salyut_bbs::paths::read_only_socket())]
-    read_only_socket: PathBuf,
     #[arg(long, default_value_os_t = salyut_bbs::paths::database())]
     database: PathBuf,
     #[arg(long, default_value = "0660", value_parser = parse_mode)]
     socket_mode: u32,
-    #[arg(long, default_value = "0660", value_parser = parse_mode)]
-    read_only_socket_mode: u32,
+    #[arg(long, default_value = "salyut-web")]
+    read_only_user: String,
 }
 
 fn parse_mode(value: &str) -> Result<u32, String> {
@@ -41,28 +39,16 @@ fn main() -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("create socket directory {}", parent.display()))?;
     }
-    if let Some(parent) = arguments.read_only_socket.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create socket directory {}", parent.display()))?;
-    }
     if let Some(parent) = arguments.database.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create database directory {}", parent.display()))?;
     }
 
     let database = Arc::new(Mutex::new(Database::open(&arguments.database)?));
-    let read_write_listener = bind_socket(&arguments.socket, arguments.socket_mode)?;
-    let read_only_listener =
-        bind_socket(&arguments.read_only_socket, arguments.read_only_socket_mode)?;
-    eprintln!(
-        "salyut-bbsd listening on {} (read/write) and {} (read-only)",
-        arguments.socket.display(),
-        arguments.read_only_socket.display()
-    );
+    let listener = bind_socket(&arguments.socket, arguments.socket_mode)?;
+    eprintln!("salyut-bbsd listening on {}", arguments.socket.display());
 
-    let read_database = Arc::clone(&database);
-    thread::spawn(move || accept_connections(read_only_listener, read_database, true));
-    accept_connections(read_write_listener, database, false);
+    accept_connections(listener, database, Arc::from(arguments.read_only_user));
     Ok(())
 }
 
@@ -76,13 +62,18 @@ fn bind_socket(path: &std::path::Path, mode: u32) -> Result<UnixListener> {
     Ok(listener)
 }
 
-fn accept_connections(listener: UnixListener, database: Arc<Mutex<Database>>, read_only: bool) {
+fn accept_connections(
+    listener: UnixListener,
+    database: Arc<Mutex<Database>>,
+    read_only_user: Arc<str>,
+) {
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
                 let database = Arc::clone(&database);
+                let read_only_user = Arc::clone(&read_only_user);
                 thread::spawn(move || {
-                    if let Err(error) = serve_client(stream, database, read_only) {
+                    if let Err(error) = serve_client(stream, database, &read_only_user) {
                         eprintln!("client error: {error:#}");
                     }
                 });
@@ -95,7 +86,7 @@ fn accept_connections(listener: UnixListener, database: Arc<Mutex<Database>>, re
 fn serve_client(
     mut stream: std::os::unix::net::UnixStream,
     database: Arc<Mutex<Database>>,
-    read_only: bool,
+    read_only_user: &str,
 ) -> Result<()> {
     const MAX_REQUEST_BYTES: u64 = 512 * 1024;
 
@@ -113,9 +104,10 @@ fn serve_client(
         error(ErrorCode::BadRequest, "request is too large")
     } else {
         match serde_json::from_str::<Request>(&line) {
-            Ok(request) if read_only && request.is_mutating() => {
-                error(ErrorCode::Forbidden, "this socket is read-only")
-            }
+            Ok(request) if denied_for_read_only_user(&account, read_only_user, &request) => error(
+                ErrorCode::Forbidden,
+                "this account has read-only BBS access",
+            ),
             Ok(request) => dispatch(&database, &account, request),
             Err(cause) => Response::Error {
                 code: ErrorCode::BadRequest,
@@ -129,6 +121,14 @@ fn serve_client(
     Ok(())
 }
 
+fn denied_for_read_only_user(
+    account: &peer::Account,
+    read_only_user: &str,
+    request: &Request,
+) -> bool {
+    account.username == read_only_user && request.is_mutating()
+}
+
 fn dispatch(database: &Mutex<Database>, account: &peer::Account, request: Request) -> Response {
     let result = (|| -> Result<Response> {
         let mut database = database
@@ -137,9 +137,7 @@ fn dispatch(database: &Mutex<Database>, account: &peer::Account, request: Reques
         database.finalize_due_proposals(chrono::Utc::now())?;
         Ok(match request {
             Request::WhoAmI => Response::Identity {
-                uid: account.uid,
                 handle: account.username.clone(),
-                groups: account.groups.clone(),
             },
             Request::ListBoards => Response::Boards(database.boards()?),
             Request::ListPosts {
@@ -151,14 +149,14 @@ fn dispatch(database: &Mutex<Database>, account: &peer::Account, request: Reques
                 None => error(ErrorCode::NotFound, "board not found"),
             },
             Request::GetPost { id } => match database.get(id, account.uid)? {
-                Some(post) => Response::Post(post),
+                Some(post) => Response::Post(Box::new(post)),
                 None => error(ErrorCode::NotFound, "post not found"),
             },
             Request::CreatePost { board, title, body } => {
-                create_post(&mut database, account, &board, &title, &body)?
+                create_post(&mut database, account, &board, &title, &body, false)?
             }
             Request::CreateProposal { board, title, body } => {
-                create_proposal(&mut database, account, &board, &title, &body)?
+                create_post(&mut database, account, &board, &title, &body, true)?
             }
             Request::UpdatePost { id, title, body } => {
                 update_post(&mut database, account, id, &title, &body)?
@@ -194,54 +192,33 @@ fn create_post(
     slug: &str,
     title: &str,
     body: &str,
+    proposal: bool,
 ) -> Result<Response> {
     let Some(board) = database.board(slug)? else {
         return Ok(error(ErrorCode::NotFound, "board not found"));
     };
-    if board.kind != BoardKind::Discussion {
-        return Ok(error(
-            ErrorCode::BadRequest,
-            "use a proposal when posting to this board",
-        ));
-    }
-    if !can_write(&board, account) {
-        return Ok(forbidden_for_board(&board));
-    }
-    Ok(Response::Created(database.create(
-        &board,
-        account.uid,
-        &account.username,
-        title,
-        body,
-    )?))
-}
-
-fn create_proposal(
-    database: &mut Database,
-    account: &peer::Account,
-    slug: &str,
-    title: &str,
-    body: &str,
-) -> Result<Response> {
-    let Some(board) = database.board(slug)? else {
-        return Ok(error(ErrorCode::NotFound, "board not found"));
+    let expected = if proposal {
+        BoardKind::Polls
+    } else {
+        BoardKind::Discussion
     };
-    if board.kind != BoardKind::Polls {
-        return Ok(error(
-            ErrorCode::BadRequest,
-            "proposals are not allowed here",
-        ));
+    if board.kind != expected {
+        let message = if proposal {
+            "proposals are not allowed here"
+        } else {
+            "use a proposal when posting to this board"
+        };
+        return Ok(error(ErrorCode::BadRequest, message));
     }
     if !can_write(&board, account) {
         return Ok(forbidden_for_board(&board));
     }
-    Ok(Response::Created(database.create_proposal(
-        &board,
-        account.uid,
-        &account.username,
-        title,
-        body,
-    )?))
+    let post = if proposal {
+        database.create_proposal(&board, account.uid, &account.username, title, body)?
+    } else {
+        database.create(&board, account.uid, &account.username, title, body)?
+    };
+    Ok(Response::Post(Box::new(post)))
 }
 
 fn update_post(
@@ -266,10 +243,11 @@ fn update_post(
     if !can_write(&post.board, account) {
         return Ok(forbidden_for_board(&post.board));
     }
-    Ok(match database.update(account.uid, id, title, body)? {
-        Some(post) => Response::Updated(post),
-        None => error(ErrorCode::NotFound, "post not found"),
-    })
+    Ok(post_or(
+        database.update(account.uid, id, title, body)?,
+        ErrorCode::NotFound,
+        "post not found",
+    ))
 }
 
 fn delete_post(database: &mut Database, account: &peer::Account, id: i64) -> Result<Response> {
@@ -313,10 +291,11 @@ fn cast_vote(
     if post.proposal.as_ref().map(|proposal| proposal.state) != Some(ProposalState::Voting) {
         return Ok(error(ErrorCode::Forbidden, "voting is closed"));
     }
-    Ok(match database.vote(account.uid, post_id, option_id)? {
-        Some(post) => Response::Voted(post),
-        None => error(ErrorCode::NotFound, "poll option not found"),
-    })
+    Ok(post_or(
+        database.vote(account.uid, post_id, option_id)?,
+        ErrorCode::NotFound,
+        "poll option not found",
+    ))
 }
 
 fn create_reply(
@@ -331,12 +310,11 @@ fn create_reply(
     if post.locked {
         return Ok(error(ErrorCode::Forbidden, "post is locked"));
     }
-    Ok(
-        match database.create_reply(account.uid, &account.username, post_id, body)? {
-            Some(post) => Response::Replied(post),
-            None => error(ErrorCode::Forbidden, "post is locked"),
-        },
-    )
+    Ok(post_or(
+        database.create_reply(account.uid, &account.username, post_id, body)?,
+        ErrorCode::Forbidden,
+        "post is locked",
+    ))
 }
 
 fn update_reply(
@@ -354,10 +332,11 @@ fn update_reply(
     let Some(post_id) = database.update_reply(account.uid, id, body)? else {
         return Ok(error(ErrorCode::NotFound, "reply not found"));
     };
-    Ok(match database.get(post_id, account.uid)? {
-        Some(post) => Response::ReplyUpdated(post),
-        None => error(ErrorCode::NotFound, "post not found"),
-    })
+    Ok(post_or(
+        database.get(post_id, account.uid)?,
+        ErrorCode::NotFound,
+        "post not found",
+    ))
 }
 
 fn delete_reply(database: &mut Database, account: &peer::Account, id: i64) -> Result<Response> {
@@ -385,10 +364,11 @@ fn set_post_locked(
             "locking posts requires Unix group wheel",
         ));
     }
-    Ok(match database.set_locked(id, locked, account.uid)? {
-        Some(post) => Response::LockChanged(post),
-        None => error(ErrorCode::NotFound, "post not found"),
-    })
+    Ok(post_or(
+        database.set_locked(id, locked, account.uid)?,
+        ErrorCode::NotFound,
+        "post not found",
+    ))
 }
 
 fn withdraw_proposal(
@@ -411,12 +391,11 @@ fn withdraw_proposal(
             "only a proposal with open voting may be withdrawn",
         ));
     }
-    Ok(
-        match database.withdraw_proposal(id, account.uid, &account.username)? {
-            Some(post) => Response::ProposalChanged(post),
-            None => error(ErrorCode::Forbidden, "proposal state changed"),
-        },
-    )
+    Ok(post_or(
+        database.withdraw_proposal(id, account.uid, &account.username)?,
+        ErrorCode::Forbidden,
+        "proposal state changed",
+    ))
 }
 
 fn veto_proposal(
@@ -440,12 +419,11 @@ fn veto_proposal(
             "only an accepted proposal may be vetoed",
         ));
     }
-    Ok(
-        match database.veto_proposal(id, account.uid, &account.username, reason)? {
-            Some(post) => Response::ProposalChanged(post),
-            None => error(ErrorCode::Forbidden, "proposal state changed"),
-        },
-    )
+    Ok(post_or(
+        database.veto_proposal(id, account.uid, &account.username, reason)?,
+        ErrorCode::Forbidden,
+        "proposal state changed",
+    ))
 }
 
 fn mark_proposal_implemented(
@@ -469,12 +447,11 @@ fn mark_proposal_implemented(
             "only an accepted proposal may be marked implemented",
         ));
     }
-    Ok(
-        match database.mark_proposal_implemented(id, account.uid, &account.username, note)? {
-            Some(post) => Response::ProposalChanged(post),
-            None => error(ErrorCode::Forbidden, "proposal state changed"),
-        },
-    )
+    Ok(post_or(
+        database.mark_proposal_implemented(id, account.uid, &account.username, note)?,
+        ErrorCode::Forbidden,
+        "proposal state changed",
+    ))
 }
 
 fn can_write(board: &Board, account: &peer::Account) -> bool {
@@ -496,6 +473,13 @@ fn forbidden_for_board(board: &Board) -> Response {
     error(ErrorCode::Forbidden, &message)
 }
 
+fn post_or(post: Option<salyut_bbs::protocol::Post>, code: ErrorCode, message: &str) -> Response {
+    post.map_or_else(
+        || error(code, message),
+        |post| Response::Post(Box::new(post)),
+    )
+}
+
 fn error(code: ErrorCode, message: &str) -> Response {
     Response::Error {
         code,
@@ -510,254 +494,187 @@ mod tests {
     use salyut_bbs::{
         db::Database,
         peer::Account,
-        protocol::{Board, BoardKind, ErrorCode, Post, ProposalState, Request, Response},
+        protocol::{ErrorCode, Post, ProposalState, Request, Response},
     };
 
-    use super::{can_write, dispatch, is_wheel};
+    use super::{denied_for_read_only_user, dispatch};
 
-    fn updates() -> Board {
-        Board {
-            id: 2,
-            slug: "updates".to_owned(),
-            name: "Updates".to_owned(),
-            description: String::new(),
-            kind: BoardKind::Discussion,
-            write_group: Some("wheel".to_owned()),
+    fn account(uid: u32, name: &str, wheel: bool) -> Account {
+        Account {
+            uid,
+            username: name.to_owned(),
+            groups: wheel.then(|| "wheel".to_owned()).into_iter().collect(),
         }
     }
 
-    #[test]
-    fn restricted_board_uses_resolved_unix_groups() {
-        let member = Account {
-            uid: 1001,
-            username: "alice".to_owned(),
-            groups: vec!["users".to_owned(), "wheel".to_owned()],
-        };
-        let non_member = Account {
-            uid: 1002,
-            username: "bob".to_owned(),
-            groups: vec!["users".to_owned()],
-        };
-        assert!(can_write(&updates(), &member));
-        assert!(!can_write(&updates(), &non_member));
-        assert!(is_wheel(&member));
-        assert!(!is_wheel(&non_member));
+    fn database() -> Mutex<Database> {
+        Mutex::new(Database::open(Path::new(":memory:")).unwrap())
     }
 
-    #[test]
-    fn only_wheel_can_lock_a_post() {
-        let database = Mutex::new(Database::open(Path::new(":memory:")).unwrap());
-        let post = {
-            let mut database = database.lock().unwrap();
-            let board = database.board("general").unwrap().unwrap();
-            database
-                .create(&board, 1001, "alice", "Thread", "Body")
-                .unwrap()
-        };
-        let member = Account {
-            uid: 1001,
-            username: "alice".to_owned(),
-            groups: vec!["users".to_owned(), "wheel".to_owned()],
-        };
-        let non_member = Account {
-            uid: 1002,
-            username: "bob".to_owned(),
-            groups: vec!["users".to_owned()],
-        };
+    fn create(database: &Mutex<Database>, board: &str) -> Post {
+        let mut database = database.lock().unwrap();
+        let board = database.board(board).unwrap().unwrap();
+        database
+            .create(&board, 1001, "alice", "Thread", "Body")
+            .unwrap()
+    }
 
-        assert!(matches!(
-            dispatch(
-                &database,
-                &non_member,
-                Request::SetPostLocked {
-                    id: post.id,
-                    locked: true
-                }
-            ),
+    fn proposal(database: &Mutex<Database>) -> Post {
+        let mut database = database.lock().unwrap();
+        let board = database.board("proposals").unwrap().unwrap();
+        database
+            .create_proposal(&board, 1001, "alice", "Garden?", "Plant herbs.")
+            .unwrap()
+    }
+
+    fn forbidden(response: Response) -> bool {
+        matches!(
+            response,
             Response::Error {
                 code: ErrorCode::Forbidden,
                 ..
             }
-        ));
+        )
+    }
+
+    #[test]
+    fn restricted_board_uses_resolved_unix_groups() {
+        let database = database();
+        let request = || Request::CreatePost {
+            board: "updates".to_owned(),
+            title: "Maintenance".to_owned(),
+            body: "Tonight.".to_owned(),
+        };
+        assert!(forbidden(dispatch(
+            &database,
+            &account(1002, "bob", false),
+            request()
+        )));
         assert!(matches!(
-            dispatch(
-                &database,
-                &member,
-                Request::SetPostLocked {
-                    id: post.id,
-                    locked: true
-                }
-            ),
-            Response::LockChanged(Post { locked: true, .. })
+            dispatch(&database, &account(1001, "alice", true), request()),
+            Response::Post(_)
+        ));
+    }
+
+    #[test]
+    fn web_identity_is_read_only_on_the_shared_socket() {
+        let web = account(998, "salyut-web", false);
+        let write = Request::CreatePost {
+            board: "general".to_owned(),
+            title: "Hello".to_owned(),
+            body: "World".to_owned(),
+        };
+
+        assert!(!denied_for_read_only_user(
+            &web,
+            "salyut-web",
+            &Request::ListBoards
+        ));
+        assert!(denied_for_read_only_user(&web, "salyut-web", &write));
+        assert!(!denied_for_read_only_user(
+            &account(1001, "alice", false),
+            "salyut-web",
+            &write
+        ));
+    }
+
+    #[test]
+    fn only_wheel_can_lock_a_post() {
+        let database = database();
+        let post = create(&database, "general");
+        let request = || Request::SetPostLocked {
+            id: post.id,
+            locked: true,
+        };
+
+        assert!(forbidden(dispatch(
+            &database,
+            &account(1002, "bob", false),
+            request()
+        )));
+        assert!(matches!(
+            dispatch(&database, &account(1001, "alice", true), request()),
+            Response::Post(post) if post.locked
         ));
     }
 
     #[test]
     fn updates_allow_replies_from_non_wheel_users() {
-        let database = Mutex::new(Database::open(Path::new(":memory:")).unwrap());
-        let post = {
-            let mut database = database.lock().unwrap();
-            let board = database.board("updates").unwrap().unwrap();
-            database
-                .create(&board, 1001, "alice", "Maintenance", "Tonight at 20:00.")
-                .unwrap()
-        };
-        let account = Account {
-            uid: 1002,
-            username: "bob".to_owned(),
-            groups: vec!["users".to_owned()],
-        };
-
+        let database = database();
+        let post = create(&database, "updates");
         assert!(matches!(
             dispatch(
                 &database,
-                &account,
-                Request::CreatePost {
-                    board: "updates".to_owned(),
-                    title: "Not allowed".to_owned(),
-                    body: "Top-level post".to_owned(),
-                }
-            ),
-            Response::Error {
-                code: ErrorCode::Forbidden,
-                ..
-            }
-        ));
-        assert!(matches!(
-            dispatch(
-                &database,
-                &account,
+                &account(1002, "bob", false),
                 Request::CreateReply {
                     post_id: post.id,
-                    body: "Thanks for the warning.".to_owned(),
+                    body: "Thanks.".to_owned(),
                 }
             ),
-            Response::Replied(Post { replies, .. }) if replies.len() == 1
+            Response::Post(post) if post.replies.len() == 1
         ));
     }
 
     #[test]
     fn proposals_are_open_to_non_wheel_users() {
-        let database = Mutex::new(Database::open(Path::new(":memory:")).unwrap());
-        let account = Account {
-            uid: 1002,
-            username: "bob".to_owned(),
-            groups: vec!["users".to_owned()],
-        };
+        let database = database();
 
         assert!(matches!(
             dispatch(
                 &database,
-                &account,
+                &account(1002, "bob", false),
                 Request::CreateProposal {
                     board: "proposals".to_owned(),
-                    title: "Add a garden?".to_owned(),
-                    body: "A small shared garden behind the server room.".to_owned(),
+                    title: "Garden?".to_owned(),
+                    body: "Plant herbs.".to_owned(),
                 }
             ),
-            Response::Created(Post {
-                author,
-                poll: Some(_),
-                ..
-            }) if author == "bob"
+            Response::Post(post) if post.author == "bob" && post.poll.is_some()
         ));
     }
 
     #[test]
     fn only_author_can_withdraw_an_open_proposal() {
-        let database = Mutex::new(Database::open(Path::new(":memory:")).unwrap());
-        let proposal = {
-            let mut database = database.lock().unwrap();
-            let board = database.board("proposals").unwrap().unwrap();
-            database
-                .create_proposal(&board, 1001, "alice", "Add a garden?", "Plant herbs.")
-                .unwrap()
-        };
-        let alice = Account {
-            uid: 1001,
-            username: "alice".to_owned(),
-            groups: vec!["users".to_owned()],
-        };
-        let bob = Account {
-            uid: 1002,
-            username: "bob".to_owned(),
-            groups: vec!["users".to_owned()],
-        };
+        let database = database();
+        let proposal = proposal(&database);
+        let request = || Request::WithdrawProposal { id: proposal.id };
 
+        assert!(forbidden(dispatch(
+            &database,
+            &account(1002, "bob", false),
+            request()
+        )));
         assert!(matches!(
-            dispatch(
-                &database,
-                &bob,
-                Request::WithdrawProposal { id: proposal.id }
-            ),
-            Response::Error {
-                code: ErrorCode::Forbidden,
-                ..
-            }
-        ));
-        assert!(matches!(
-            dispatch(
-                &database,
-                &alice,
-                Request::WithdrawProposal { id: proposal.id }
-            ),
-            Response::ProposalChanged(Post {
-                proposal: Some(proposal),
-                ..
-            }) if proposal.state == ProposalState::Withdrawn
+            dispatch(&database, &account(1001, "alice", false), request()),
+            Response::Post(post)
+                if post.proposal.as_ref().unwrap().state == ProposalState::Withdrawn
         ));
     }
 
     #[test]
     fn veto_requires_wheel_and_a_published_reason() {
-        let database = Mutex::new(Database::open(Path::new(":memory:")).unwrap());
-        let proposal = {
+        let database = database();
+        let proposal = proposal(&database);
+        {
             let mut database = database.lock().unwrap();
-            let board = database.board("proposals").unwrap().unwrap();
-            let proposal = database
-                .create_proposal(&board, 1001, "alice", "Add a garden?", "Plant herbs.")
-                .unwrap();
             let option = proposal.poll.as_ref().unwrap().options[0].id;
             database.vote(1001, proposal.id, option).unwrap();
             database
                 .finalize_due_proposals(proposal.proposal.as_ref().unwrap().closes_at)
                 .unwrap();
-            proposal
-        };
-        let member = Account {
-            uid: 1002,
-            username: "bob".to_owned(),
-            groups: vec!["users".to_owned()],
-        };
-        let operator = Account {
-            uid: 0,
-            username: "root".to_owned(),
-            groups: vec!["wheel".to_owned()],
+        }
+        let request = |reason: &str| Request::VetoProposal {
+            id: proposal.id,
+            reason: reason.to_owned(),
         };
 
+        assert!(forbidden(dispatch(
+            &database,
+            &account(1002, "bob", false),
+            request("No space.")
+        )));
         assert!(matches!(
-            dispatch(
-                &database,
-                &member,
-                Request::VetoProposal {
-                    id: proposal.id,
-                    reason: "No space.".to_owned(),
-                }
-            ),
-            Response::Error {
-                code: ErrorCode::Forbidden,
-                ..
-            }
-        ));
-        assert!(matches!(
-            dispatch(
-                &database,
-                &operator,
-                Request::VetoProposal {
-                    id: proposal.id,
-                    reason: String::new(),
-                }
-            ),
+            dispatch(&database, &account(0, "root", true), request("")),
             Response::Error {
                 code: ErrorCode::BadRequest,
                 ..
@@ -766,16 +683,11 @@ mod tests {
         assert!(matches!(
             dispatch(
                 &database,
-                &operator,
-                Request::VetoProposal {
-                    id: proposal.id,
-                    reason: "Exceeds available space.".to_owned(),
-                }
+                &account(0, "root", true),
+                request("Exceeds available space.")
             ),
-            Response::ProposalChanged(Post {
-                proposal: Some(proposal),
-                ..
-            }) if proposal.state == ProposalState::Vetoed
+            Response::Post(post)
+                if post.proposal.as_ref().unwrap().state == ProposalState::Vetoed
         ));
     }
 }
