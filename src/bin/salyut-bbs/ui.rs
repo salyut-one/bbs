@@ -70,10 +70,17 @@ fn draw_board_description(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect)
         .as_ref()
         .map(|group| format!(" · new threads: {group}"))
         .unwrap_or_default();
+    let mail = if !app.mail_eligible {
+        " · mail: ineligible"
+    } else if app.mail_subscriptions[app.board_selected] {
+        " · mail: subscribed"
+    } else {
+        " · mail: unsubscribed"
+    };
     frame.render_widget(
         Paragraph::new(format!(
-            "/{} · {}{}",
-            board.slug, board.description, restriction
+            "/{} · {}{}{}",
+            board.slug, board.description, restriction, mail
         ))
         .block(Block::default().borders(Borders::ALL)),
         area,
@@ -151,6 +158,8 @@ fn draw_help(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
                 Span::raw(" delete  "),
                 key("r"),
                 Span::raw(" refresh  "),
+                key("m"),
+                Span::raw(" toggle mail  "),
                 key("q"),
                 Span::raw(" quit"),
             ]),

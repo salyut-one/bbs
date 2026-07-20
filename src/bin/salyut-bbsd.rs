@@ -27,6 +27,8 @@ struct Arguments {
     socket_mode: u32,
     #[arg(long, default_value = "salyut-web")]
     read_only_user: String,
+    #[arg(long, default_value = "salyut-bbs-mail")]
+    mail_user: String,
 }
 
 fn parse_mode(value: &str) -> Result<u32, String> {
@@ -48,7 +50,12 @@ fn main() -> Result<()> {
     let listener = bind_socket(&arguments.socket, arguments.socket_mode)?;
     eprintln!("salyut-bbsd listening on {}", arguments.socket.display());
 
-    accept_connections(listener, database, Arc::from(arguments.read_only_user));
+    accept_connections(
+        listener,
+        database,
+        Arc::from(arguments.read_only_user),
+        Arc::from(arguments.mail_user),
+    );
     Ok(())
 }
 
@@ -66,14 +73,17 @@ fn accept_connections(
     listener: UnixListener,
     database: Arc<Mutex<Database>>,
     read_only_user: Arc<str>,
+    mail_user: Arc<str>,
 ) {
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
                 let database = Arc::clone(&database);
                 let read_only_user = Arc::clone(&read_only_user);
+                let mail_user = Arc::clone(&mail_user);
                 thread::spawn(move || {
-                    if let Err(error) = serve_client(stream, database, &read_only_user) {
+                    if let Err(error) = serve_client(stream, database, &read_only_user, &mail_user)
+                    {
                         eprintln!("client error: {error:#}");
                     }
                 });
@@ -87,6 +97,7 @@ fn serve_client(
     mut stream: std::os::unix::net::UnixStream,
     database: Arc<Mutex<Database>>,
     read_only_user: &str,
+    mail_user: &str,
 ) -> Result<()> {
     const MAX_REQUEST_BYTES: u64 = 512 * 1024;
 
@@ -104,6 +115,10 @@ fn serve_client(
         error(ErrorCode::BadRequest, "request is too large")
     } else {
         match serde_json::from_str::<Request>(&line) {
+            Ok(request) if denied_for_mail_bridge(&account, mail_user, &request) => error(
+                ErrorCode::Forbidden,
+                "operation is restricted to its BBS client",
+            ),
             Ok(request) if denied_for_read_only_user(&account, read_only_user, &request) => error(
                 ErrorCode::Forbidden,
                 "this account has read-only BBS access",
@@ -127,6 +142,10 @@ fn denied_for_read_only_user(
     request: &Request,
 ) -> bool {
     account.username == read_only_user && request.is_mutating()
+}
+
+fn denied_for_mail_bridge(account: &peer::Account, mail_user: &str, request: &Request) -> bool {
+    request.is_mail_worker() != (account.username == mail_user)
 }
 
 fn dispatch(database: &Mutex<Database>, account: &peer::Account, request: Request) -> Response {
@@ -180,6 +199,40 @@ fn dispatch(database: &Mutex<Database>, account: &peer::Account, request: Reques
             Request::MarkProposalImplemented { id, note } => {
                 mark_proposal_implemented(&mut database, account, id, &note)?
             }
+            Request::GetMailSubscription { board } => {
+                get_mail_subscription(&database, account, &board)?
+            }
+            Request::SetMailSubscription { board, subscribed } => {
+                set_mail_subscription(&mut database, account, &board, subscribed)?
+            }
+            Request::MailClaimDelivery => Response::MailDelivery(
+                database
+                    .claim_mail_delivery(chrono::Utc::now())?
+                    .map(Box::new),
+            ),
+            Request::MailCompleteDelivery { id } => {
+                if database.complete_mail_delivery(id)? {
+                    Response::MailDeliveryUpdated { id }
+                } else {
+                    error(ErrorCode::NotFound, "mail delivery is not leased")
+                }
+            }
+            Request::MailFailDelivery { id, error: message } => {
+                if database.fail_mail_delivery(id, &message)? {
+                    Response::MailDeliveryUpdated { id }
+                } else {
+                    error(ErrorCode::NotFound, "mail delivery is not leased")
+                }
+            }
+            Request::MailImportReply {
+                token,
+                message_id,
+                body,
+            } => import_mail_reply(&mut database, &token, &message_id, &body)?,
+            Request::MailUnsubscribe { token } => match database.unsubscribe_mail_token(&token)? {
+                Some(board) => Response::MailUnsubscribed { board },
+                None => error(ErrorCode::NotFound, "unsubscribe token not found"),
+            },
         })
     })();
 
@@ -213,10 +266,25 @@ fn create_post(
     if !can_write(&board, account) {
         return Ok(forbidden_for_board(&board));
     }
+    let recipients = peer::mail_recipients()?;
     let post = if proposal {
-        database.create_proposal(&board, account.uid, &account.username, title, body)?
+        database.create_proposal_with_mail(
+            &board,
+            account.uid,
+            &account.username,
+            title,
+            body,
+            &recipients,
+        )?
     } else {
-        database.create(&board, account.uid, &account.username, title, body)?
+        database.create_with_mail(
+            &board,
+            account.uid,
+            &account.username,
+            title,
+            body,
+            &recipients,
+        )?
     };
     Ok(Response::Post(Box::new(post)))
 }
@@ -310,8 +378,15 @@ fn create_reply(
     if post.locked {
         return Ok(error(ErrorCode::Forbidden, "post is locked"));
     }
+    let recipients = peer::mail_recipients()?;
     Ok(post_or(
-        database.create_reply(account.uid, &account.username, post_id, body)?,
+        database.create_reply_with_mail(
+            account.uid,
+            &account.username,
+            post_id,
+            body,
+            &recipients,
+        )?,
         ErrorCode::Forbidden,
         "post is locked",
     ))
@@ -454,6 +529,89 @@ fn mark_proposal_implemented(
     ))
 }
 
+fn get_mail_subscription(
+    database: &Database,
+    account: &peer::Account,
+    board: &str,
+) -> Result<Response> {
+    let eligible = peer::mail_eligible(account.uid);
+    Ok(
+        match database.mail_subscription(account.uid, board, eligible)? {
+            Some(subscribed) => Response::MailSubscription {
+                board: board.to_owned(),
+                subscribed,
+                eligible,
+            },
+            None => error(ErrorCode::NotFound, "board not found"),
+        },
+    )
+}
+
+fn set_mail_subscription(
+    database: &mut Database,
+    account: &peer::Account,
+    board: &str,
+    subscribed: bool,
+) -> Result<Response> {
+    if !peer::mail_eligible(account.uid) {
+        return Ok(error(
+            ErrorCode::Forbidden,
+            "mail delivery requires a Unix UID from 1000 through 59999",
+        ));
+    }
+    Ok(
+        match database.set_mail_subscription(account.uid, &account.username, board, subscribed)? {
+            Some(subscribed) => Response::MailSubscription {
+                board: board.to_owned(),
+                subscribed,
+                eligible: true,
+            },
+            None => error(ErrorCode::NotFound, "board not found"),
+        },
+    )
+}
+
+fn import_mail_reply(
+    database: &mut Database,
+    token: &str,
+    message_id: &str,
+    body: &str,
+) -> Result<Response> {
+    if let Some(post_id) = database.imported_mail_post(message_id)? {
+        return Ok(Response::MailReplyAccepted {
+            post_id,
+            duplicate: true,
+        });
+    }
+    let Some((post_id, uid)) = database.mail_reply_target(token)? else {
+        return Ok(error(ErrorCode::NotFound, "mail reply token not found"));
+    };
+    if !peer::mail_eligible(uid) {
+        return Ok(error(
+            ErrorCode::Forbidden,
+            "mail reply account is no longer eligible",
+        ));
+    }
+    let account = peer::account(uid)?;
+    let recipients = peer::mail_recipients()?;
+    Ok(
+        match database.import_mail_reply(
+            account.uid,
+            &account.username,
+            post_id,
+            message_id,
+            body,
+            &recipients,
+        )? {
+            Some(imported) => Response::MailReplyAccepted {
+                post_id: imported.post_id,
+                duplicate: imported.duplicate,
+            },
+            None => error(ErrorCode::Forbidden, "post is locked or no longer exists"),
+        },
+    )
+}
+
 fn can_write(board: &Board, account: &peer::Account) -> bool {
     board
         .write_group
@@ -497,7 +655,7 @@ mod tests {
         protocol::{ErrorCode, Post, ProposalState, Request, Response},
     };
 
-    use super::{denied_for_read_only_user, dispatch};
+    use super::{denied_for_mail_bridge, denied_for_read_only_user, dispatch};
 
     fn account(uid: u32, name: &str, wheel: bool) -> Account {
         Account {
@@ -575,6 +733,32 @@ mod tests {
             &account(1001, "alice", false),
             "salyut-web",
             &write
+        ));
+    }
+
+    #[test]
+    fn mail_protocol_is_available_only_to_the_mail_bridge() {
+        let user = account(1001, "alice", false);
+        let mail = account(997, "salyut-bbs-mail", false);
+        assert!(denied_for_mail_bridge(
+            &user,
+            "salyut-bbs-mail",
+            &Request::MailClaimDelivery
+        ));
+        assert!(!denied_for_mail_bridge(
+            &mail,
+            "salyut-bbs-mail",
+            &Request::MailClaimDelivery
+        ));
+        assert!(denied_for_mail_bridge(
+            &mail,
+            "salyut-bbs-mail",
+            &Request::ListBoards
+        ));
+        assert!(!denied_for_mail_bridge(
+            &user,
+            "salyut-bbs-mail",
+            &Request::ListBoards
         ));
     }
 

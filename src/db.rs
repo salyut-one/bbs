@@ -1,17 +1,35 @@
+use std::io::Read;
+
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::protocol::{
-    Board, BoardKind, Poll, PollOption, Post, PostSummary, Proposal, ProposalEvent, ProposalState,
-    Reply,
+    Board, BoardKind, MailDelivery, Poll, PollOption, Post, PostSummary, Proposal, ProposalEvent,
+    ProposalState, Reply,
 };
 
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_TRANSITION_NOTE_BYTES: usize = 4 * 1024;
+const MAX_MAIL_ERROR_BYTES: usize = 4 * 1024;
+const MAX_MESSAGE_ID_BYTES: usize = 998;
+const MAIL_LEASE_MINUTES: i64 = 5;
+const MAIL_MAX_ATTEMPTS: u32 = 3;
 pub const PROPOSAL_VOTING_DAYS: i64 = 7;
 const PROPOSAL_OPTIONS: [&str; 3] = ["For", "Against", "Abstain"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailRecipient {
+    pub uid: u32,
+    pub username: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportedMailReply {
+    pub post_id: i64,
+    pub duplicate: bool,
+}
 
 pub struct Database {
     connection: Connection,
@@ -145,11 +163,70 @@ impl Database {
                  );
 
                  CREATE INDEX IF NOT EXISTS proposal_events_post
-                     ON proposal_events(post_id, created_at, id);",
+                     ON proposal_events(post_id, created_at, id);
+
+                 CREATE TABLE IF NOT EXISTS mail_preferences (
+                     board_id          INTEGER NOT NULL REFERENCES boards(id),
+                     user_uid          INTEGER NOT NULL,
+                     username          TEXT NOT NULL,
+                     subscribed        INTEGER NOT NULL DEFAULT 1,
+                     unsubscribe_token TEXT NOT NULL UNIQUE,
+                     updated_at        TEXT NOT NULL,
+                     PRIMARY KEY(board_id, user_uid)
+                 );
+
+                 CREATE TABLE IF NOT EXISTS mail_thread_tokens (
+                     post_id     INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                     user_uid    INTEGER NOT NULL,
+                     token       TEXT NOT NULL UNIQUE,
+                     created_at  TEXT NOT NULL,
+                     PRIMARY KEY(post_id, user_uid)
+                 );
+
+                 CREATE TABLE IF NOT EXISTS mail_events (
+                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                     board_id     INTEGER NOT NULL REFERENCES boards(id),
+                     post_id      INTEGER NOT NULL,
+                     reply_id     INTEGER,
+                     author       TEXT NOT NULL,
+                     subject      TEXT NOT NULL,
+                     body         TEXT NOT NULL,
+                     message_id   TEXT NOT NULL UNIQUE,
+                     in_reply_to  TEXT,
+                     created_at   TEXT NOT NULL
+                 );
+
+                 CREATE TABLE IF NOT EXISTS mail_deliveries (
+                     id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                     event_id         INTEGER NOT NULL REFERENCES mail_events(id) ON DELETE CASCADE,
+                     user_uid         INTEGER NOT NULL,
+                     recipient        TEXT NOT NULL,
+                     state            TEXT NOT NULL CHECK (
+                          state IN ('pending', 'leased', 'retry', 'delivered', 'cancelled',
+                                    'failed')
+                     ),
+                     attempts         INTEGER NOT NULL DEFAULT 0,
+                     available_at     TEXT NOT NULL,
+                     lease_until      TEXT,
+                     last_error       TEXT,
+                     delivered_at     TEXT,
+                     UNIQUE(event_id, user_uid)
+                 );
+
+                 CREATE INDEX IF NOT EXISTS mail_deliveries_ready
+                     ON mail_deliveries(state, available_at, lease_until, id);
+
+                 CREATE TABLE IF NOT EXISTS mail_inbound (
+                     message_id   TEXT PRIMARY KEY,
+                     post_id      INTEGER NOT NULL,
+                     reply_id     INTEGER NOT NULL,
+                     received_at  TEXT NOT NULL
+                 );",
             )
-            .context("initialize poll, reply, and proposal schema")?;
+            .context("initialize poll, reply, proposal, and mail schema")?;
 
         migrate_legacy_proposals(&mut connection)?;
+        migrate_mail_delivery_states(&mut connection)?;
 
         Ok(Self { connection })
     }
@@ -256,6 +333,18 @@ impl Database {
         title: &str,
         body: &str,
     ) -> Result<Post> {
+        self.create_with_mail(board, uid, author, title, body, &[])
+    }
+
+    pub fn create_with_mail(
+        &mut self,
+        board: &Board,
+        uid: u32,
+        author: &str,
+        title: &str,
+        body: &str,
+        recipients: &[MailRecipient],
+    ) -> Result<Post> {
         validate_post(title, body)?;
         let timestamp = Utc::now().to_rfc3339();
         let transaction = self.connection.transaction()?;
@@ -266,6 +355,19 @@ impl Database {
             params![board.id, uid, author, title.trim(), body, timestamp],
         )?;
         let id = transaction.last_insert_rowid();
+        enqueue_mail_event(
+            &transaction,
+            board,
+            id,
+            None,
+            author,
+            title.trim(),
+            body,
+            &format!("<bbs-post-{id}@salyut.one>"),
+            None,
+            &timestamp,
+            recipients,
+        )?;
         transaction.commit()?;
         self.get(id, uid)?.context("newly created post disappeared")
     }
@@ -277,6 +379,18 @@ impl Database {
         author: &str,
         title: &str,
         body: &str,
+    ) -> Result<Post> {
+        self.create_proposal_with_mail(board, uid, author, title, body, &[])
+    }
+
+    pub fn create_proposal_with_mail(
+        &mut self,
+        board: &Board,
+        uid: u32,
+        author: &str,
+        title: &str,
+        body: &str,
+        recipients: &[MailRecipient],
     ) -> Result<Post> {
         validate_post(title, body)?;
         let opened_at = Utc::now();
@@ -310,6 +424,19 @@ impl Database {
              VALUES (?1, NULL, 'voting', ?2, ?3, ?4)",
             params![id, uid, author, timestamp],
         )?;
+        enqueue_mail_event(
+            &transaction,
+            board,
+            id,
+            None,
+            author,
+            title.trim(),
+            body,
+            &format!("<bbs-post-{id}@salyut.one>"),
+            None,
+            &timestamp,
+            recipients,
+        )?;
         transaction.commit()?;
         self.get(id, uid)?
             .context("newly created proposal disappeared")
@@ -329,10 +456,22 @@ impl Database {
     }
 
     pub fn delete(&mut self, uid: u32, id: i64) -> Result<bool> {
-        Ok(self.connection.execute(
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
             "DELETE FROM posts WHERE id = ?1 AND author_uid = ?2",
             params![id, uid],
-        )? != 0)
+        )?;
+        if changed != 0 {
+            transaction.execute(
+                "UPDATE mail_deliveries
+                 SET state = 'cancelled', lease_until = NULL
+                 WHERE state IN ('pending', 'retry')
+                   AND event_id IN (SELECT id FROM mail_events WHERE post_id = ?1)",
+                [id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed != 0)
     }
 
     pub fn vote(&mut self, uid: u32, post_id: i64, option_id: i64) -> Result<Option<Post>> {
@@ -377,6 +516,17 @@ impl Database {
         post_id: i64,
         body: &str,
     ) -> Result<Option<Post>> {
+        self.create_reply_with_mail(uid, author, post_id, body, &[])
+    }
+
+    pub fn create_reply_with_mail(
+        &mut self,
+        uid: u32,
+        author: &str,
+        post_id: i64,
+        body: &str,
+        recipients: &[MailRecipient],
+    ) -> Result<Option<Post>> {
         validate_body(body)?;
         let timestamp = Utc::now().to_rfc3339();
         let transaction = self.connection.transaction()?;
@@ -390,9 +540,25 @@ impl Database {
         if changed == 0 {
             return Ok(None);
         }
+        let reply_id = transaction.last_insert_rowid();
+        let (board, title) = mail_post_context(&transaction, post_id)?
+            .context("post disappeared while creating reply")?;
         transaction.execute(
             "UPDATE posts SET updated_at = ?1 WHERE id = ?2",
             params![timestamp, post_id],
+        )?;
+        enqueue_mail_event(
+            &transaction,
+            &board,
+            post_id,
+            Some(reply_id),
+            author,
+            &format!("Re: {title}"),
+            body,
+            &format!("<bbs-reply-{reply_id}@salyut.one>"),
+            Some(&format!("<bbs-post-{post_id}@salyut.one>")),
+            &timestamp,
+            recipients,
         )?;
         transaction.commit()?;
         self.get(post_id, uid)
@@ -411,10 +577,21 @@ impl Database {
 
     pub fn delete_reply(&mut self, uid: u32, id: i64) -> Result<Option<i64>> {
         let post_id = self.reply_post_id(id)?;
-        let changed = self.connection.execute(
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
             "DELETE FROM replies WHERE id = ?1 AND author_uid = ?2",
             params![id, uid],
         )?;
+        if changed != 0 {
+            transaction.execute(
+                "UPDATE mail_deliveries
+                 SET state = 'cancelled', lease_until = NULL
+                 WHERE state IN ('pending', 'retry')
+                   AND event_id IN (SELECT id FROM mail_events WHERE reply_id = ?1)",
+                [id],
+            )?;
+        }
+        transaction.commit()?;
         Ok((changed != 0).then_some(post_id).flatten())
     }
 
@@ -729,6 +906,289 @@ impl Database {
             .context("read replies")
     }
 
+    pub fn mail_subscription(
+        &self,
+        uid: u32,
+        board_slug: &str,
+        eligible: bool,
+    ) -> Result<Option<bool>> {
+        let Some(board) = self.board(board_slug)? else {
+            return Ok(None);
+        };
+        if !eligible {
+            return Ok(Some(false));
+        }
+        let subscribed = self
+            .connection
+            .query_row(
+                "SELECT subscribed FROM mail_preferences
+                 WHERE board_id = ?1 AND user_uid = ?2",
+                params![board.id, uid],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(true);
+        Ok(Some(subscribed))
+    }
+
+    pub fn set_mail_subscription(
+        &mut self,
+        uid: u32,
+        username: &str,
+        board_slug: &str,
+        subscribed: bool,
+    ) -> Result<Option<bool>> {
+        let Some(board) = self.board(board_slug)? else {
+            return Ok(None);
+        };
+        let now = Utc::now().to_rfc3339();
+        let token = random_token()?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO mail_preferences
+                 (board_id, user_uid, username, subscribed, unsubscribe_token, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(board_id, user_uid) DO UPDATE SET
+                 username = excluded.username,
+                 subscribed = excluded.subscribed,
+                 updated_at = excluded.updated_at",
+            params![board.id, uid, username, subscribed, token, now],
+        )?;
+        if !subscribed {
+            cancel_mail_for_subscription(&transaction, board.id, uid)?;
+        }
+        transaction.commit()?;
+        Ok(Some(subscribed))
+    }
+
+    pub fn mail_reply_target(&self, token: &str) -> Result<Option<(i64, u32)>> {
+        validate_token(token)?;
+        self.connection
+            .query_row(
+                "SELECT mt.post_id, mt.user_uid
+                 FROM mail_thread_tokens mt
+                 JOIN posts p ON p.id = mt.post_id
+                 JOIN mail_preferences mp
+                   ON mp.board_id = p.board_id AND mp.user_uid = mt.user_uid
+                 WHERE mt.token = ?1 AND mp.subscribed = 1",
+                [token],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .context("resolve mail reply token")
+    }
+
+    pub fn imported_mail_post(&self, message_id: &str) -> Result<Option<i64>> {
+        validate_message_id(message_id)?;
+        self.connection
+            .query_row(
+                "SELECT post_id FROM mail_inbound WHERE message_id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("check imported mail message")
+    }
+
+    pub fn claim_mail_delivery(&mut self, now: DateTime<Utc>) -> Result<Option<MailDelivery>> {
+        let timestamp = now.to_rfc3339();
+        let lease_until = (now + Duration::minutes(MAIL_LEASE_MINUTES)).to_rfc3339();
+        let transaction = self.connection.transaction()?;
+        let delivery = transaction
+            .query_row(
+                "SELECT d.id, d.recipient, b.slug, e.post_id, e.author, e.subject,
+                        e.body, e.message_id, e.in_reply_to, mt.token,
+                        mp.unsubscribe_token
+                 FROM mail_deliveries d
+                 JOIN mail_events e ON e.id = d.event_id
+                 JOIN boards b ON b.id = e.board_id
+                 JOIN mail_preferences mp
+                   ON mp.board_id = e.board_id AND mp.user_uid = d.user_uid
+                 JOIN mail_thread_tokens mt
+                   ON mt.post_id = e.post_id AND mt.user_uid = d.user_uid
+                 WHERE mp.subscribed = 1
+                   AND (
+                       (d.state IN ('pending', 'retry') AND d.available_at <= ?1)
+                       OR (d.state = 'leased' AND d.lease_until <= ?1)
+                   )
+                 ORDER BY d.id
+                 LIMIT 1",
+                [&timestamp],
+                |row| {
+                    Ok(MailDelivery {
+                        id: row.get(0)?,
+                        recipient: row.get(1)?,
+                        board_slug: row.get(2)?,
+                        post_id: row.get(3)?,
+                        author: row.get(4)?,
+                        subject: row.get(5)?,
+                        body: row.get(6)?,
+                        message_id: row.get(7)?,
+                        in_reply_to: row.get(8)?,
+                        reply_token: row.get(9)?,
+                        unsubscribe_token: row.get(10)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(delivery) = &delivery {
+            transaction.execute(
+                "UPDATE mail_deliveries
+                 SET state = 'leased', attempts = attempts + 1,
+                     lease_until = ?1, last_error = NULL
+                 WHERE id = ?2",
+                params![lease_until, delivery.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(delivery)
+    }
+
+    pub fn complete_mail_delivery(&mut self, id: i64) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE mail_deliveries
+             SET state = 'delivered', delivered_at = ?1, lease_until = NULL
+             WHERE id = ?2 AND state = 'leased'",
+            params![Utc::now().to_rfc3339(), id],
+        )? != 0)
+    }
+
+    pub fn fail_mail_delivery(&mut self, id: i64, message: &str) -> Result<bool> {
+        if message.len() > MAX_MAIL_ERROR_BYTES {
+            bail!("mail delivery error is too long");
+        }
+        let attempts = self
+            .connection
+            .query_row(
+                "SELECT attempts FROM mail_deliveries WHERE id = ?1 AND state = 'leased'",
+                [id],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()?;
+        let Some(attempts) = attempts else {
+            return Ok(false);
+        };
+        if attempts >= MAIL_MAX_ATTEMPTS {
+            return Ok(self.connection.execute(
+                "UPDATE mail_deliveries
+                 SET state = 'failed', lease_until = NULL, last_error = ?1
+                 WHERE id = ?2 AND state = 'leased'",
+                params![message, id],
+            )? != 0);
+        }
+        let delay_seconds = 30_i64 * (1_i64 << attempts);
+        let available_at = (Utc::now() + Duration::seconds(delay_seconds)).to_rfc3339();
+        Ok(self.connection.execute(
+            "UPDATE mail_deliveries
+             SET state = 'retry', available_at = ?1, lease_until = NULL, last_error = ?2
+             WHERE id = ?3 AND state = 'leased'",
+            params![available_at, message, id],
+        )? != 0)
+    }
+
+    pub fn unsubscribe_mail_token(&mut self, token: &str) -> Result<Option<String>> {
+        validate_token(token)?;
+        let preference = self
+            .connection
+            .query_row(
+                "SELECT mp.board_id, mp.user_uid, b.slug
+                 FROM mail_preferences mp
+                 JOIN boards b ON b.id = mp.board_id
+                 WHERE mp.unsubscribe_token = ?1",
+                [token],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((board_id, uid, board_slug)) = preference else {
+            return Ok(None);
+        };
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE mail_preferences
+             SET subscribed = 0, updated_at = ?1
+             WHERE board_id = ?2 AND user_uid = ?3",
+            params![Utc::now().to_rfc3339(), board_id, uid],
+        )?;
+        cancel_mail_for_subscription(&transaction, board_id, uid)?;
+        transaction.commit()?;
+        Ok(Some(board_slug))
+    }
+
+    pub fn import_mail_reply(
+        &mut self,
+        uid: u32,
+        author: &str,
+        post_id: i64,
+        message_id: &str,
+        body: &str,
+        recipients: &[MailRecipient],
+    ) -> Result<Option<ImportedMailReply>> {
+        validate_message_id(message_id)?;
+        if let Some(existing_post_id) = self
+            .connection
+            .query_row(
+                "SELECT post_id FROM mail_inbound WHERE message_id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            return Ok(Some(ImportedMailReply {
+                post_id: existing_post_id,
+                duplicate: true,
+            }));
+        }
+        validate_body(body)?;
+        let timestamp = Utc::now().to_rfc3339();
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "INSERT INTO replies
+                 (post_id, author_uid, author, body, created_at, updated_at)
+             SELECT id, ?1, ?2, ?3, ?4, ?4
+             FROM posts WHERE id = ?5 AND locked = 0",
+            params![uid, author, body, timestamp, post_id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let reply_id = transaction.last_insert_rowid();
+        let (board, title) = mail_post_context(&transaction, post_id)?
+            .context("post disappeared while importing mail reply")?;
+        transaction.execute(
+            "INSERT INTO mail_inbound (message_id, post_id, reply_id, received_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![message_id, post_id, reply_id, timestamp],
+        )?;
+        transaction.execute(
+            "UPDATE posts SET updated_at = ?1 WHERE id = ?2",
+            params![timestamp, post_id],
+        )?;
+        enqueue_mail_event(
+            &transaction,
+            &board,
+            post_id,
+            Some(reply_id),
+            author,
+            &format!("Re: {title}"),
+            body,
+            &format!("<bbs-reply-{reply_id}@salyut.one>"),
+            Some(&format!("<bbs-post-{post_id}@salyut.one>")),
+            &timestamp,
+            recipients,
+        )?;
+        transaction.commit()?;
+        Ok(Some(ImportedMailReply {
+            post_id,
+            duplicate: false,
+        }))
+    }
+
     fn reply_post_id(&self, id: i64) -> Result<Option<i64>> {
         self.connection
             .query_row("SELECT post_id FROM replies WHERE id = ?1", [id], |row| {
@@ -737,6 +1197,208 @@ impl Database {
             .optional()
             .context("read reply post")
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_mail_event(
+    transaction: &rusqlite::Transaction<'_>,
+    board: &Board,
+    post_id: i64,
+    reply_id: Option<i64>,
+    author: &str,
+    subject: &str,
+    body: &str,
+    message_id: &str,
+    in_reply_to: Option<&str>,
+    timestamp: &str,
+    recipients: &[MailRecipient],
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO mail_events
+             (board_id, post_id, reply_id, author, subject, body,
+              message_id, in_reply_to, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            board.id,
+            post_id,
+            reply_id,
+            author,
+            subject,
+            body,
+            message_id,
+            in_reply_to,
+            timestamp
+        ],
+    )?;
+    let event_id = transaction.last_insert_rowid();
+    for recipient in recipients {
+        let unsubscribe_token = random_token()?;
+        transaction.execute(
+            "INSERT INTO mail_preferences
+                 (board_id, user_uid, username, subscribed, unsubscribe_token, updated_at)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5)
+             ON CONFLICT(board_id, user_uid) DO UPDATE SET
+                 username = excluded.username,
+                 updated_at = excluded.updated_at",
+            params![
+                board.id,
+                recipient.uid,
+                recipient.username,
+                unsubscribe_token,
+                timestamp
+            ],
+        )?;
+        let subscribed: bool = transaction.query_row(
+            "SELECT subscribed FROM mail_preferences
+             WHERE board_id = ?1 AND user_uid = ?2",
+            params![board.id, recipient.uid],
+            |row| row.get(0),
+        )?;
+        if !subscribed {
+            continue;
+        }
+        let reply_token = random_token()?;
+        transaction.execute(
+            "INSERT INTO mail_thread_tokens (post_id, user_uid, token, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(post_id, user_uid) DO NOTHING",
+            params![post_id, recipient.uid, reply_token, timestamp],
+        )?;
+        transaction.execute(
+            "INSERT INTO mail_deliveries
+                 (event_id, user_uid, recipient, state, available_at)
+             VALUES (?1, ?2, ?3, 'pending', ?4)",
+            params![event_id, recipient.uid, recipient.username, timestamp],
+        )?;
+    }
+    Ok(())
+}
+
+fn mail_post_context(
+    transaction: &rusqlite::Transaction<'_>,
+    post_id: i64,
+) -> Result<Option<(Board, String)>> {
+    transaction
+        .query_row(
+            "SELECT b.id, b.slug, b.name, b.description, b.kind, b.write_group, p.title
+             FROM posts p
+             JOIN boards b ON b.id = p.board_id
+             WHERE p.id = ?1",
+            [post_id],
+            |row| Ok((board_from_row(row)?, row.get(6)?)),
+        )
+        .optional()
+        .context("read post mail context")
+}
+
+fn cancel_mail_for_subscription(
+    transaction: &rusqlite::Transaction<'_>,
+    board_id: i64,
+    uid: u32,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE mail_deliveries
+         SET state = 'cancelled', lease_until = NULL
+         WHERE user_uid = ?1
+           AND state IN ('pending', 'retry')
+           AND event_id IN (SELECT id FROM mail_events WHERE board_id = ?2)",
+        params![uid, board_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM mail_thread_tokens
+         WHERE user_uid = ?1
+           AND post_id IN (SELECT id FROM posts WHERE board_id = ?2)",
+        params![uid, board_id],
+    )?;
+    Ok(())
+}
+
+fn random_token() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .context("open operating-system random source")?
+        .read_exact(&mut bytes)
+        .context("read operating-system random source")?;
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut token, "{byte:02x}")?;
+    }
+    Ok(token)
+}
+
+fn validate_token(token: &str) -> Result<()> {
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("invalid mail token");
+    }
+    Ok(())
+}
+
+fn validate_message_id(message_id: &str) -> Result<()> {
+    if message_id.trim().is_empty()
+        || message_id.len() > MAX_MESSAGE_ID_BYTES
+        || message_id.contains(['\r', '\n'])
+    {
+        bail!("invalid Message-ID");
+    }
+    Ok(())
+}
+
+fn migrate_mail_delivery_states(connection: &mut Connection) -> Result<()> {
+    let schema = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'mail_deliveries'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+    if schema.contains("'failed'") {
+        return Ok(());
+    }
+    let transaction = connection
+        .transaction()
+        .context("start mail delivery state migration")?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE mail_deliveries RENAME TO mail_deliveries_legacy;
+
+             CREATE TABLE mail_deliveries (
+                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_id         INTEGER NOT NULL REFERENCES mail_events(id) ON DELETE CASCADE,
+                 user_uid         INTEGER NOT NULL,
+                 recipient        TEXT NOT NULL,
+                 state            TEXT NOT NULL CHECK (
+                     state IN ('pending', 'leased', 'retry', 'delivered', 'cancelled',
+                               'failed')
+                 ),
+                 attempts         INTEGER NOT NULL DEFAULT 0,
+                 available_at     TEXT NOT NULL,
+                 lease_until      TEXT,
+                 last_error       TEXT,
+                 delivered_at     TEXT,
+                 UNIQUE(event_id, user_uid)
+             );
+
+             INSERT INTO mail_deliveries SELECT * FROM mail_deliveries_legacy;
+
+             DROP TABLE mail_deliveries_legacy;
+
+             CREATE INDEX IF NOT EXISTS mail_deliveries_ready
+                 ON mail_deliveries(state, available_at, lease_until, id);",
+        )
+        .context("add the failed state to mail deliveries")?;
+    transaction
+        .commit()
+        .context("commit mail delivery state migration")?;
+    Ok(())
 }
 
 fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -945,9 +1607,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Database, PROPOSAL_VOTING_DAYS};
+    use super::{Database, MailRecipient, PROPOSAL_VOTING_DAYS};
     use crate::protocol::ProposalState;
-    use chrono::Duration;
+    use chrono::{Duration, Utc};
     use rusqlite::Connection;
 
     #[test]
@@ -964,6 +1626,182 @@ mod tests {
         assert_eq!(boards[1].write_group.as_deref(), Some("wheel"));
         assert!(boards[0].write_group.is_none());
         assert!(boards[2].write_group.is_none());
+    }
+
+    fn mail_recipients() -> Vec<MailRecipient> {
+        vec![
+            MailRecipient {
+                uid: 1001,
+                username: "alice".to_owned(),
+            },
+            MailRecipient {
+                uid: 1002,
+                username: "bob".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn mail_delivery_is_opt_out_and_unsubscribe_cancels_pending_mail() {
+        let mut database = Database::open(Path::new(":memory:")).unwrap();
+        assert_eq!(
+            database.mail_subscription(1001, "general", true).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            database.mail_subscription(999, "general", false).unwrap(),
+            Some(false)
+        );
+        database
+            .set_mail_subscription(1002, "bob", "general", false)
+            .unwrap();
+        let board = database.board("general").unwrap().unwrap();
+        database
+            .create_with_mail(
+                &board,
+                1001,
+                "alice",
+                "Mail thread",
+                "Opening body.",
+                &mail_recipients(),
+            )
+            .unwrap();
+
+        let delivery = database.claim_mail_delivery(Utc::now()).unwrap().unwrap();
+        assert_eq!(delivery.recipient, "alice");
+        assert!(database.complete_mail_delivery(delivery.id).unwrap());
+        assert!(database.claim_mail_delivery(Utc::now()).unwrap().is_none());
+
+        let board = database
+            .unsubscribe_mail_token(&delivery.unsubscribe_token)
+            .unwrap()
+            .unwrap();
+        assert_eq!(board, "general");
+        assert_eq!(
+            database.mail_subscription(1001, "general", true).unwrap(),
+            Some(false)
+        );
+        assert!(
+            database
+                .mail_reply_target(&delivery.reply_token)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mail_delivery_fails_permanently_after_three_attempts() {
+        let mut database = Database::open(Path::new(":memory:")).unwrap();
+        database
+            .set_mail_subscription(1002, "bob", "general", false)
+            .unwrap();
+        let board = database.board("general").unwrap().unwrap();
+        database
+            .create_with_mail(
+                &board,
+                1001,
+                "alice",
+                "Mail thread",
+                "Opening body.",
+                &mail_recipients(),
+            )
+            .unwrap();
+
+        let delivery = database.claim_mail_delivery(Utc::now()).unwrap().unwrap();
+        assert!(
+            database
+                .fail_mail_delivery(delivery.id, "smtp down")
+                .unwrap()
+        );
+        let retry = Utc::now() + Duration::seconds(30);
+        assert!(database.claim_mail_delivery(retry).unwrap().is_none());
+
+        let mut later = Utc::now() + Duration::hours(1);
+        for _ in 0..2 {
+            let delivery = database.claim_mail_delivery(later).unwrap().unwrap();
+            assert!(
+                database
+                    .fail_mail_delivery(delivery.id, "smtp down")
+                    .unwrap()
+            );
+            later += Duration::hours(1);
+        }
+        assert!(database.claim_mail_delivery(later).unwrap().is_none());
+        let state: String = database
+            .connection
+            .query_row("SELECT state FROM mail_deliveries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn mail_reply_is_deduplicated_and_uses_the_normal_reply_model() {
+        let mut database = Database::open(Path::new(":memory:")).unwrap();
+        let board = database.board("general").unwrap().unwrap();
+        let post = database
+            .create_with_mail(
+                &board,
+                1001,
+                "alice",
+                "Mail thread",
+                "Opening body.",
+                &mail_recipients(),
+            )
+            .unwrap();
+        let delivery = database.claim_mail_delivery(Utc::now()).unwrap().unwrap();
+        let (token_post_id, uid) = database
+            .mail_reply_target(&delivery.reply_token)
+            .unwrap()
+            .unwrap();
+        assert_eq!((token_post_id, uid), (post.id, 1001));
+
+        let imported = database
+            .import_mail_reply(
+                uid,
+                "alice",
+                post.id,
+                "<incoming-1@salyut.one>",
+                "Reply from mail.",
+                &mail_recipients(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!imported.duplicate);
+        assert_eq!(
+            database.get(post.id, uid).unwrap().unwrap().replies[0].body,
+            "Reply from mail."
+        );
+        let duplicate = database
+            .import_mail_reply(
+                uid,
+                "alice",
+                post.id,
+                "<incoming-1@salyut.one>",
+                "This must not be imported twice.",
+                &mail_recipients(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(
+            database.get(post.id, uid).unwrap().unwrap().replies.len(),
+            1
+        );
+
+        database.set_locked(post.id, true, uid).unwrap();
+        assert!(
+            database
+                .import_mail_reply(
+                    uid,
+                    "alice",
+                    post.id,
+                    "<incoming-2@salyut.one>",
+                    "Too late.",
+                    &mail_recipients(),
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1219,6 +2057,74 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(withdrawn.proposal.unwrap().state, ProposalState::Withdrawn);
+    }
+
+    #[test]
+    fn migrates_mail_deliveries_to_allow_the_failed_state() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "salyut-bbs-mail-migration-{}-{nonce}.sqlite3",
+            std::process::id()
+        ));
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE mail_events (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         board_id INTEGER NOT NULL,
+                         post_id INTEGER NOT NULL,
+                         reply_id INTEGER,
+                         author TEXT NOT NULL,
+                         subject TEXT NOT NULL,
+                         body TEXT NOT NULL,
+                         message_id TEXT NOT NULL UNIQUE,
+                         in_reply_to TEXT,
+                         created_at TEXT NOT NULL
+                     );
+                     CREATE TABLE mail_deliveries (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         event_id INTEGER NOT NULL REFERENCES mail_events(id) ON DELETE CASCADE,
+                         user_uid INTEGER NOT NULL,
+                         recipient TEXT NOT NULL,
+                         state TEXT NOT NULL CHECK (
+                             state IN ('pending', 'leased', 'retry', 'delivered', 'cancelled')
+                         ),
+                         attempts INTEGER NOT NULL DEFAULT 0,
+                         available_at TEXT NOT NULL,
+                         lease_until TEXT,
+                         last_error TEXT,
+                         delivered_at TEXT,
+                         UNIQUE(event_id, user_uid)
+                     );
+                     INSERT INTO mail_events
+                         (board_id, post_id, author, subject, body, message_id, created_at)
+                     VALUES (1, 1, 'alice', 'Legacy', 'Body',
+                             '<legacy@salyut.one>', '2026-01-01T00:00:00Z');
+                     INSERT INTO mail_deliveries
+                         (event_id, user_uid, recipient, state, available_at)
+                     VALUES (1, 1002, 'bob', 'pending', '2026-01-01T00:00:00Z');",
+                )
+                .unwrap();
+        }
+        {
+            let database = Database::open(&path).unwrap();
+            database
+                .connection
+                .execute("UPDATE mail_deliveries SET state = 'failed'", [])
+                .unwrap();
+            let (state, recipient): (String, String) = database
+                .connection
+                .query_row("SELECT state, recipient FROM mail_deliveries", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert_eq!((state.as_str(), recipient.as_str()), ("failed", "bob"));
+        }
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

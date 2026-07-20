@@ -62,6 +62,29 @@ pub enum Request {
         id: i64,
         note: String,
     },
+    GetMailSubscription {
+        board: String,
+    },
+    SetMailSubscription {
+        board: String,
+        subscribed: bool,
+    },
+    MailClaimDelivery,
+    MailCompleteDelivery {
+        id: i64,
+    },
+    MailFailDelivery {
+        id: i64,
+        error: String,
+    },
+    MailImportReply {
+        token: String,
+        message_id: String,
+        body: String,
+    },
+    MailUnsubscribe {
+        token: String,
+    },
 }
 
 impl Request {
@@ -80,6 +103,23 @@ impl Request {
                 | Self::WithdrawProposal { .. }
                 | Self::VetoProposal { .. }
                 | Self::MarkProposalImplemented { .. }
+                | Self::SetMailSubscription { .. }
+                | Self::MailClaimDelivery
+                | Self::MailCompleteDelivery { .. }
+                | Self::MailFailDelivery { .. }
+                | Self::MailImportReply { .. }
+                | Self::MailUnsubscribe { .. }
+        )
+    }
+
+    pub fn is_mail_worker(&self) -> bool {
+        matches!(
+            self,
+            Self::MailClaimDelivery
+                | Self::MailCompleteDelivery { .. }
+                | Self::MailFailDelivery { .. }
+                | Self::MailImportReply { .. }
+                | Self::MailUnsubscribe { .. }
         )
     }
 }
@@ -184,6 +224,21 @@ pub struct PollOption {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailDelivery {
+    pub id: i64,
+    pub recipient: String,
+    pub board_slug: String,
+    pub post_id: i64,
+    pub author: String,
+    pub subject: String,
+    pub body: String,
+    pub message_id: String,
+    pub in_reply_to: Option<String>,
+    pub reply_token: String,
+    pub unsubscribe_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostSummary {
     pub id: i64,
     pub board_slug: String,
@@ -200,13 +255,39 @@ pub struct PostSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", content = "data", rename_all = "snake_case")]
 pub enum Response {
-    Identity { handle: String },
+    Identity {
+        handle: String,
+    },
     Boards(Vec<Board>),
     Posts(Vec<PostSummary>),
     Post(Box<Post>),
-    ReplyDeleted { id: i64, post_id: i64 },
-    Deleted { id: i64 },
-    Error { code: ErrorCode, message: String },
+    ReplyDeleted {
+        id: i64,
+        post_id: i64,
+    },
+    Deleted {
+        id: i64,
+    },
+    MailSubscription {
+        board: String,
+        subscribed: bool,
+        eligible: bool,
+    },
+    MailDelivery(Option<Box<MailDelivery>>),
+    MailDeliveryUpdated {
+        id: i64,
+    },
+    MailReplyAccepted {
+        post_id: i64,
+        duplicate: bool,
+    },
+    MailUnsubscribed {
+        board: String,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

@@ -9,6 +9,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
+use crate::db::MailRecipient;
+
+pub const MAIL_UID_MIN: u32 = 1000;
+pub const MAIL_UID_MAX_EXCLUSIVE: u32 = 60_000;
+
 #[derive(Debug, Clone)]
 pub struct Account {
     pub uid: u32,
@@ -104,6 +109,41 @@ pub fn account(uid: u32) -> Result<Account> {
         username: name,
         groups,
     })
+}
+
+pub fn mail_eligible(uid: u32) -> bool {
+    (MAIL_UID_MIN..MAIL_UID_MAX_EXCLUSIVE).contains(&uid)
+}
+
+pub fn mail_recipients() -> Result<Vec<MailRecipient>> {
+    let passwd = std::fs::read_to_string("/etc/passwd").context("read /etc/passwd")?;
+    let mut recipients = passwd
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':');
+            let username = fields.next()?;
+            fields.next()?;
+            let uid = fields.next()?.parse::<u32>().ok()?;
+            (mail_eligible(uid) && valid_mail_username(username)).then(|| MailRecipient {
+                uid,
+                username: username.to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    recipients.sort_by(|left, right| {
+        left.uid
+            .cmp(&right.uid)
+            .then_with(|| left.username.cmp(&right.username))
+    });
+    recipients.dedup_by_key(|recipient| recipient.uid);
+    Ok(recipients)
+}
+
+fn valid_mail_username(username: &str) -> bool {
+    !username.is_empty()
+        && username
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn groups_for_user(username: &str, primary_gid: libc::gid_t) -> Result<Vec<String>> {
@@ -208,10 +248,20 @@ fn group_name(gid: libc::gid_t) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{account, mail_eligible};
+
+    #[test]
+    fn mail_uid_range_includes_1000_and_excludes_60000() {
+        assert!(!mail_eligible(999));
+        assert!(mail_eligible(1000));
+        assert!(mail_eligible(59_999));
+        assert!(!mail_eligible(60_000));
+    }
+
     #[test]
     fn current_account_includes_its_primary_group() {
         // SAFETY: getuid has no preconditions.
-        let account = super::account(unsafe { libc::getuid() }).unwrap();
+        let account = account(unsafe { libc::getuid() }).unwrap();
         assert!(!account.groups.is_empty());
     }
 }

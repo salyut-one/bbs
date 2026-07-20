@@ -1,0 +1,2 @@
+# Merge this entry into the transport map used by Postfix, then run postmap.
+bbs.salyut.one bbs:

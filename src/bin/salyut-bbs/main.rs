@@ -175,6 +175,8 @@ struct App {
     selected: usize,
     reply_selected: usize,
     viewed: Option<Post>,
+    mail_subscriptions: Vec<bool>,
+    mail_eligible: bool,
     mode: Mode,
     message: String,
     quit: bool,
@@ -188,6 +190,15 @@ fn main() -> Result<()> {
     if boards.is_empty() {
         bail!("daemon returned no boards");
     }
+    let subscriptions = boards
+        .iter()
+        .map(|board| client.mail_subscription(&board.slug))
+        .collect::<Result<Vec<_>>>()?;
+    let mail_eligible = subscriptions.iter().all(|(_, eligible)| *eligible);
+    let mail_subscriptions = subscriptions
+        .into_iter()
+        .map(|(subscribed, _)| subscribed)
+        .collect();
     let mut app = App {
         client,
         handle,
@@ -197,6 +208,8 @@ fn main() -> Result<()> {
         selected: 0,
         reply_selected: 0,
         viewed: None,
+        mail_subscriptions,
+        mail_eligible,
         mode: Mode::Browse,
         message: String::new(),
         quit: false,
@@ -308,6 +321,7 @@ fn handle_browse_key(
     match key.code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char('m') => app.toggle_mail_subscription(),
         KeyCode::Right | KeyCode::Char(']') | KeyCode::Tab => app.next_board(),
         KeyCode::Left | KeyCode::Char('[') | KeyCode::BackTab => app.previous_board(),
         KeyCode::Char('n') => {
@@ -549,6 +563,26 @@ impl App {
                     self.selected.min(self.posts.len() - 1)
                 };
                 self.message = format!("{} post(s)", self.posts.len());
+            }
+            Err(error) => self.message = error.to_string(),
+        }
+    }
+
+    fn toggle_mail_subscription(&mut self) {
+        if !self.mail_eligible {
+            self.message = "Mail delivery requires a Unix UID from 1000 through 59999".to_owned();
+            return;
+        }
+        let board = self.current_board().slug.clone();
+        let subscribed = !self.mail_subscriptions[self.board_selected];
+        match self.client.set_mail_subscription(&board, subscribed) {
+            Ok(subscribed) => {
+                self.mail_subscriptions[self.board_selected] = subscribed;
+                self.message = if subscribed {
+                    format!("Subscribed to /{board} mail")
+                } else {
+                    format!("Unsubscribed from /{board} mail")
+                };
             }
             Err(error) => self.message = error.to_string(),
         }

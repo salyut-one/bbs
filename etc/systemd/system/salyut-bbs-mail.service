@@ -1,0 +1,18 @@
+[Unit]
+Description=salyut.one BBS mail delivery worker
+After=local-fs.target postfix.service salyut-bbsd.service
+Requires=salyut-bbsd.service
+
+[Service]
+Type=simple
+User=salyut-bbs-mail
+Group=salyut-bbs
+ExecStart=/usr/local/bin/salyut-bbs-mail deliver
+Restart=on-failure
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/spool/postfix/maildrop
+
+[Install]
+WantedBy=salyut-bbsd.service

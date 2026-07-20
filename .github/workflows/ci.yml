@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install build tools
-        run: dnf install -y cargo gcc git make rust shadow-utils systemd
+        run: dnf install -y cargo gcc git make postfix rust shadow-utils systemd
       - name: Build and test
         run: |
           make build
@@ -38,8 +38,28 @@ jobs:
           useradd --system --gid salyut-bbs \
             --home-dir /var/lib/salyut-bbs --shell /usr/sbin/nologin salyut-bbsd
           make install
+          make install
+          systemd-sysusers /etc/sysusers.d/salyut-bbs-mail.conf
           systemd-tmpfiles --create /etc/tmpfiles.d/salyut-bbs.conf
-          systemd-analyze verify /etc/systemd/system/salyut-bbsd.service
+          systemd-analyze verify \
+            /etc/systemd/system/salyut-bbsd.service \
+            /etc/systemd/system/salyut-bbs-mail.service
           test -x /usr/local/bin/salyut-bbs
           test -x /usr/local/bin/salyut-bbsd
+          test -x /usr/local/bin/salyut-bbs-mail
           test -L /usr/local/bin/bbs
+          test -f /etc/postfix/salyut-bbs-transport
+          test -f /etc/postfix/salyut-bbs-transport.db
+          postmap -q bbs.salyut.one \
+            hash:/etc/postfix/salyut-bbs-transport | grep -Fx 'bbs:'
+          test "$(
+            postconf -h transport_maps | tr ',' '\n' |
+              sed 's/^[[:space:]]*//' |
+              grep -Fxc 'hash:/etc/postfix/salyut-bbs-transport'
+          )" = 1
+          postconf -M bbs/unix | grep -F \
+            'argv=/usr/local/bin/salyut-bbs-mail receive --recipient=${recipient}'
+          test "$(postconf -h bbs_destination_recipient_limit)" = 1
+          test -L \
+            /etc/systemd/system/salyut-bbsd.service.wants/salyut-bbs-mail.service
+          id salyut-bbs-mail

@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::protocol::{Board, ErrorCode, Post, PostSummary, Request, Response};
+use crate::protocol::{Board, ErrorCode, MailDelivery, Post, PostSummary, Request, Response};
 
 #[derive(Clone)]
 pub struct Client {
@@ -133,6 +133,78 @@ impl Client {
             id,
             note: note.to_owned(),
         })?)
+    }
+
+    pub fn mail_subscription(&self, board: &str) -> Result<(bool, bool)> {
+        match self.call(&Request::GetMailSubscription {
+            board: board.to_owned(),
+        })? {
+            Response::MailSubscription {
+                subscribed,
+                eligible,
+                ..
+            } => Ok((subscribed, eligible)),
+            response => result_error(response),
+        }
+    }
+
+    pub fn set_mail_subscription(&self, board: &str, subscribed: bool) -> Result<bool> {
+        match self.call(&Request::SetMailSubscription {
+            board: board.to_owned(),
+            subscribed,
+        })? {
+            Response::MailSubscription { subscribed, .. } => Ok(subscribed),
+            response => result_error(response),
+        }
+    }
+
+    pub fn claim_mail_delivery(&self) -> Result<Option<MailDelivery>> {
+        match self.call(&Request::MailClaimDelivery)? {
+            Response::MailDelivery(delivery) => Ok(delivery.map(|delivery| *delivery)),
+            response => result_error(response),
+        }
+    }
+
+    pub fn complete_mail_delivery(&self, id: i64) -> Result<()> {
+        match self.call(&Request::MailCompleteDelivery { id })? {
+            Response::MailDeliveryUpdated { .. } => Ok(()),
+            response => result_error(response),
+        }
+    }
+
+    pub fn fail_mail_delivery(&self, id: i64, error: &str) -> Result<()> {
+        match self.call(&Request::MailFailDelivery {
+            id,
+            error: error.to_owned(),
+        })? {
+            Response::MailDeliveryUpdated { .. } => Ok(()),
+            response => result_error(response),
+        }
+    }
+
+    pub fn import_mail_reply(
+        &self,
+        token: &str,
+        message_id: &str,
+        body: &str,
+    ) -> Result<(i64, bool)> {
+        match self.call(&Request::MailImportReply {
+            token: token.to_owned(),
+            message_id: message_id.to_owned(),
+            body: body.to_owned(),
+        })? {
+            Response::MailReplyAccepted { post_id, duplicate } => Ok((post_id, duplicate)),
+            response => result_error(response),
+        }
+    }
+
+    pub fn unsubscribe_mail_token(&self, token: &str) -> Result<String> {
+        match self.call(&Request::MailUnsubscribe {
+            token: token.to_owned(),
+        })? {
+            Response::MailUnsubscribed { board } => Ok(board),
+            response => result_error(response),
+        }
     }
 
     fn call(&self, request: &Request) -> Result<Response> {
