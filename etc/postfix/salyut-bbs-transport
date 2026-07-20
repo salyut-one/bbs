@@ -1,2 +1,2 @@
-# Merge this entry into the transport map used by Postfix, then run postmap.
+# Route authenticated board posts and capability replies through the BBS bridge.
 bbs.salyut.one bbs:

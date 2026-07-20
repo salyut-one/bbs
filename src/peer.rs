@@ -111,6 +111,38 @@ pub fn account(uid: u32) -> Result<Account> {
     })
 }
 
+pub fn account_by_username(username: &str) -> Result<Account> {
+    let username = CString::new(username).context("Unix username contains a NUL byte")?;
+    let buffer_size = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let buffer_size = if buffer_size <= 0 {
+        16 * 1024
+    } else {
+        buffer_size as usize
+    };
+    let mut buffer = vec![0_u8; buffer_size];
+    let mut entry = MaybeUninit::<libc::passwd>::uninit();
+    let mut result = ptr::null_mut();
+
+    // SAFETY: all buffers and output pointers are valid for the duration of the call.
+    let status = unsafe {
+        libc::getpwnam_r(
+            username.as_ptr(),
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status)).context("resolve Unix username");
+    }
+    if result.is_null() {
+        bail!("no Unix user exists for authenticated username");
+    }
+    // SAFETY: a successful getpwnam_r returned a valid entry backed by buffer.
+    account(unsafe { (*result).pw_uid })
+}
+
 pub fn mail_eligible(uid: u32) -> bool {
     (MAIL_UID_MIN..MAIL_UID_MAX_EXCLUSIVE).contains(&uid)
 }
@@ -248,7 +280,7 @@ fn group_name(gid: libc::gid_t) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{account, mail_eligible};
+    use super::{account, account_by_username, mail_eligible};
 
     #[test]
     fn mail_uid_range_includes_1000_and_excludes_60000() {
@@ -263,5 +295,15 @@ mod tests {
         // SAFETY: getuid has no preconditions.
         let account = account(unsafe { libc::getuid() }).unwrap();
         assert!(!account.groups.is_empty());
+    }
+
+    #[test]
+    fn current_account_resolves_by_username() {
+        // SAFETY: getuid has no preconditions.
+        let by_uid = account(unsafe { libc::getuid() }).unwrap();
+        let by_name = account_by_username(&by_uid.username).unwrap();
+        assert_eq!(by_name.uid, by_uid.uid);
+        assert_eq!(by_name.username, by_uid.username);
+        assert_eq!(by_name.groups, by_uid.groups);
     }
 }

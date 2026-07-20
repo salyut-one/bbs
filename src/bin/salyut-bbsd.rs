@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use salyut_bbs::{
-    db::Database,
+    db::{Database, MailPostImport},
     peer,
     protocol::{Board, BoardKind, ErrorCode, ProposalState, Request, Response},
 };
@@ -229,6 +229,13 @@ fn dispatch(database: &Mutex<Database>, account: &peer::Account, request: Reques
                 message_id,
                 body,
             } => import_mail_reply(&mut database, &token, &message_id, &body)?,
+            Request::MailImportPost {
+                board,
+                username,
+                message_id,
+                title,
+                body,
+            } => import_mail_post(&mut database, &board, &username, &message_id, &title, &body)?,
             Request::MailUnsubscribe { token } => match database.unsubscribe_mail_token(&token)? {
                 Some(board) => Response::MailUnsubscribed { board },
                 None => error(ErrorCode::NotFound, "unsubscribe token not found"),
@@ -577,7 +584,7 @@ fn import_mail_reply(
     message_id: &str,
     body: &str,
 ) -> Result<Response> {
-    if let Some(post_id) = database.imported_mail_post(message_id)? {
+    if let Some(post_id) = database.imported_mail_message(message_id)? {
         return Ok(Response::MailReplyAccepted {
             post_id,
             duplicate: true,
@@ -610,6 +617,60 @@ fn import_mail_reply(
             None => error(ErrorCode::Forbidden, "post is locked or no longer exists"),
         },
     )
+}
+
+fn import_mail_post(
+    database: &mut Database,
+    board_slug: &str,
+    username: &str,
+    message_id: &str,
+    title: &str,
+    body: &str,
+) -> Result<Response> {
+    let account = peer::account_by_username(username)?;
+    import_mail_post_for_account(database, board_slug, &account, message_id, title, body)
+}
+
+fn import_mail_post_for_account(
+    database: &mut Database,
+    board_slug: &str,
+    account: &peer::Account,
+    message_id: &str,
+    title: &str,
+    body: &str,
+) -> Result<Response> {
+    if !peer::mail_eligible(account.uid) {
+        return Ok(error(
+            ErrorCode::Forbidden,
+            "email posting requires a Unix UID from 1000 through 59999",
+        ));
+    }
+    let Some(board) = database.board(board_slug)? else {
+        return Ok(error(ErrorCode::NotFound, "board not found"));
+    };
+    if board.kind != BoardKind::Discussion {
+        return Ok(error(
+            ErrorCode::BadRequest,
+            "email can create discussion posts but not proposals",
+        ));
+    }
+    if !can_write(&board, account) {
+        return Ok(forbidden_for_board(&board));
+    }
+    let recipients = peer::mail_recipients()?;
+    let imported = database.import_mail_post(MailPostImport {
+        board: &board,
+        uid: account.uid,
+        author: &account.username,
+        message_id,
+        title,
+        body,
+        recipients: &recipients,
+    })?;
+    Ok(Response::MailPostAccepted {
+        post_id: imported.post_id,
+        duplicate: imported.duplicate,
+    })
 }
 
 fn can_write(board: &Board, account: &peer::Account) -> bool {
@@ -655,7 +716,9 @@ mod tests {
         protocol::{ErrorCode, Post, ProposalState, Request, Response},
     };
 
-    use super::{denied_for_mail_bridge, denied_for_read_only_user, dispatch};
+    use super::{
+        denied_for_mail_bridge, denied_for_read_only_user, dispatch, import_mail_post_for_account,
+    };
 
     fn account(uid: u32, name: &str, wheel: bool) -> Account {
         Account {
@@ -740,6 +803,13 @@ mod tests {
     fn mail_protocol_is_available_only_to_the_mail_bridge() {
         let user = account(1001, "alice", false);
         let mail = account(997, "salyut-bbs-mail", false);
+        let import = Request::MailImportPost {
+            board: "updates".to_owned(),
+            username: "alice".to_owned(),
+            message_id: "<mail-post@salyut.one>".to_owned(),
+            title: "Maintenance".to_owned(),
+            body: "Tonight.".to_owned(),
+        };
         assert!(denied_for_mail_bridge(
             &user,
             "salyut-bbs-mail",
@@ -750,6 +820,8 @@ mod tests {
             "salyut-bbs-mail",
             &Request::MailClaimDelivery
         ));
+        assert!(denied_for_mail_bridge(&user, "salyut-bbs-mail", &import));
+        assert!(!denied_for_mail_bridge(&mail, "salyut-bbs-mail", &import));
         assert!(denied_for_mail_bridge(
             &mail,
             "salyut-bbs-mail",
@@ -759,6 +831,38 @@ mod tests {
             &user,
             "salyut-bbs-mail",
             &Request::ListBoards
+        ));
+    }
+
+    #[test]
+    fn email_posting_enforces_the_normal_board_group() {
+        let mut database = Database::open(Path::new(":memory:")).unwrap();
+        let response = import_mail_post_for_account(
+            &mut database,
+            "updates",
+            &account(1002, "bob", false),
+            "<bob-update@salyut.one>",
+            "Maintenance",
+            "Tonight.",
+        )
+        .unwrap();
+        assert!(forbidden(response));
+
+        let response = import_mail_post_for_account(
+            &mut database,
+            "updates",
+            &account(1001, "alice", true),
+            "<alice-update@salyut.one>",
+            "Maintenance",
+            "Tonight.",
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            Response::MailPostAccepted {
+                duplicate: false,
+                ..
+            }
         ));
     }
 

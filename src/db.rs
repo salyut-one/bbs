@@ -31,6 +31,22 @@ pub struct ImportedMailReply {
     pub duplicate: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportedMailPost {
+    pub post_id: i64,
+    pub duplicate: bool,
+}
+
+pub struct MailPostImport<'a> {
+    pub board: &'a Board,
+    pub uid: u32,
+    pub author: &'a str,
+    pub message_id: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub recipients: &'a [MailRecipient],
+}
+
 pub struct Database {
     connection: Connection,
 }
@@ -220,6 +236,12 @@ impl Database {
                      message_id   TEXT PRIMARY KEY,
                      post_id      INTEGER NOT NULL,
                      reply_id     INTEGER NOT NULL,
+                     received_at  TEXT NOT NULL
+                 );
+
+                 CREATE TABLE IF NOT EXISTS mail_post_inbound (
+                     message_id   TEXT PRIMARY KEY,
+                     post_id      INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
                      received_at  TEXT NOT NULL
                  );",
             )
@@ -978,16 +1000,71 @@ impl Database {
             .context("resolve mail reply token")
     }
 
-    pub fn imported_mail_post(&self, message_id: &str) -> Result<Option<i64>> {
+    pub fn imported_mail_message(&self, message_id: &str) -> Result<Option<i64>> {
         validate_message_id(message_id)?;
         self.connection
             .query_row(
-                "SELECT post_id FROM mail_inbound WHERE message_id = ?1",
+                "SELECT post_id FROM mail_inbound WHERE message_id = ?1
+                 UNION ALL
+                 SELECT post_id FROM mail_post_inbound WHERE message_id = ?1
+                 LIMIT 1",
                 [message_id],
                 |row| row.get(0),
             )
             .optional()
             .context("check imported mail message")
+    }
+
+    pub fn import_mail_post(&mut self, import: MailPostImport<'_>) -> Result<ImportedMailPost> {
+        let MailPostImport {
+            board,
+            uid,
+            author,
+            message_id,
+            title,
+            body,
+            recipients,
+        } = import;
+        validate_message_id(message_id)?;
+        if let Some(post_id) = self.imported_mail_message(message_id)? {
+            return Ok(ImportedMailPost {
+                post_id,
+                duplicate: true,
+            });
+        }
+        validate_post(title, body)?;
+        let timestamp = Utc::now().to_rfc3339();
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO posts
+                 (board_id, author_uid, author, title, body, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![board.id, uid, author, title.trim(), body, timestamp],
+        )?;
+        let post_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO mail_post_inbound (message_id, post_id, received_at)
+             VALUES (?1, ?2, ?3)",
+            params![message_id, post_id, timestamp],
+        )?;
+        enqueue_mail_event(
+            &transaction,
+            board,
+            post_id,
+            None,
+            author,
+            title.trim(),
+            body,
+            &format!("<bbs-post-{post_id}@salyut.one>"),
+            None,
+            &timestamp,
+            recipients,
+        )?;
+        transaction.commit()?;
+        Ok(ImportedMailPost {
+            post_id,
+            duplicate: false,
+        })
     }
 
     pub fn claim_mail_delivery(&mut self, now: DateTime<Utc>) -> Result<Option<MailDelivery>> {
@@ -1133,7 +1210,10 @@ impl Database {
         if let Some(existing_post_id) = self
             .connection
             .query_row(
-                "SELECT post_id FROM mail_inbound WHERE message_id = ?1",
+                "SELECT post_id FROM mail_inbound WHERE message_id = ?1
+             UNION ALL
+             SELECT post_id FROM mail_post_inbound WHERE message_id = ?1
+             LIMIT 1",
                 [message_id],
                 |row| row.get(0),
             )
@@ -1607,7 +1687,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Database, MailRecipient, PROPOSAL_VOTING_DAYS};
+    use super::{Database, MailPostImport, MailRecipient, PROPOSAL_VOTING_DAYS};
     use crate::protocol::ProposalState;
     use chrono::{Duration, Utc};
     use rusqlite::Connection;
@@ -1732,6 +1812,43 @@ mod tests {
             .query_row("SELECT state FROM mail_deliveries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn mail_post_is_transactional_and_deduplicated() {
+        let mut database = Database::open(Path::new(":memory:")).unwrap();
+        let board = database.board("general").unwrap().unwrap();
+        let imported = database
+            .import_mail_post(MailPostImport {
+                board: &board,
+                uid: 1001,
+                author: "alice",
+                message_id: "<new-thread@salyut.one>",
+                title: "Posted by mail",
+                body: "Opening body.",
+                recipients: &mail_recipients(),
+            })
+            .unwrap();
+        assert!(!imported.duplicate);
+        let post = database.get(imported.post_id, 1001).unwrap().unwrap();
+        assert_eq!(post.author, "alice");
+        assert_eq!(post.title, "Posted by mail");
+        assert_eq!(post.body, "Opening body.");
+
+        let duplicate = database
+            .import_mail_post(MailPostImport {
+                board: &board,
+                uid: 1001,
+                author: "alice",
+                message_id: "<new-thread@salyut.one>",
+                title: "Changed subject",
+                body: "This must not be imported twice.",
+                recipients: &mail_recipients(),
+            })
+            .unwrap();
+        assert!(duplicate.duplicate);
+        assert_eq!(duplicate.post_id, imported.post_id);
+        assert_eq!(database.list("general", 20, 0).unwrap().unwrap().len(), 1);
     }
 
     #[test]

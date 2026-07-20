@@ -64,7 +64,7 @@ install:
 				"transport_maps = $$current, hash:$(POSTFIX_TRANSPORT_MAP)" ;; \
 		esac; \
 		$(POSTCONF) -M \
-			'bbs/unix=bbs unix - n n - - pipe flags=Rq user=salyut-bbs-mail argv=$(PREFIX)/bin/salyut-bbs-mail receive --recipient=$${recipient}'; \
+			'bbs/unix=bbs unix - n n - - pipe flags=Rqu user=salyut-bbs-mail argv=$(PREFIX)/bin/salyut-bbs-mail receive --recipient=$${recipient} --sasl-username=$${sasl_username}'; \
 		$(POSTCONF) -e 'bbs_destination_recipient_limit = 1'; \
 		$(POSTFIX) check; \
 		$(SYSTEMCTL) enable salyut-bbs-mail.service; \

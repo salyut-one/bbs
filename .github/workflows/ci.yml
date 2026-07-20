@@ -58,7 +58,7 @@ jobs:
               grep -Fxc 'hash:/etc/postfix/salyut-bbs-transport'
           )" = 1
           postconf -M bbs/unix | grep -F \
-            'argv=/usr/local/bin/salyut-bbs-mail receive --recipient=${recipient}'
+            'argv=/usr/local/bin/salyut-bbs-mail receive --recipient=${recipient} --sasl-username=${sasl_username}'
           test "$(postconf -h bbs_destination_recipient_limit)" = 1
           test -L \
             /etc/systemd/system/salyut-bbsd.service.wants/salyut-bbs-mail.service

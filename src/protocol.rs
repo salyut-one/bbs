@@ -82,6 +82,13 @@ pub enum Request {
         message_id: String,
         body: String,
     },
+    MailImportPost {
+        board: String,
+        username: String,
+        message_id: String,
+        title: String,
+        body: String,
+    },
     MailUnsubscribe {
         token: String,
     },
@@ -108,6 +115,7 @@ impl Request {
                 | Self::MailCompleteDelivery { .. }
                 | Self::MailFailDelivery { .. }
                 | Self::MailImportReply { .. }
+                | Self::MailImportPost { .. }
                 | Self::MailUnsubscribe { .. }
         )
     }
@@ -119,6 +127,7 @@ impl Request {
                 | Self::MailCompleteDelivery { .. }
                 | Self::MailFailDelivery { .. }
                 | Self::MailImportReply { .. }
+                | Self::MailImportPost { .. }
                 | Self::MailUnsubscribe { .. }
         )
     }
@@ -278,6 +287,10 @@ pub enum Response {
         id: i64,
     },
     MailReplyAccepted {
+        post_id: i64,
+        duplicate: bool,
+    },
+    MailPostAccepted {
         post_id: i64,
         duplicate: bool,
     },

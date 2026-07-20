@@ -43,13 +43,22 @@ and acknowledges successful deliveries. Postfix pipes replies and unsubscribe
 requests back to the same binary. Recipient-specific capability addresses map a
 reply to its Unix UID and BBS thread, so mail headers cannot select an author.
 
+To create a discussion post, send authenticated mail from your salyut.one
+account to `<board>@bbs.salyut.one`, for example `updates@bbs.salyut.one`. The
+message subject becomes the post title and its `text/plain` part becomes the
+body. Postfix's authenticated SASL username selects the Unix author, and the
+daemon applies the board's normal write-group rule, so posting to `/updates`
+still requires `wheel`. Unauthenticated local `sendmail` submissions are
+rejected, and proposals cannot be created by email.
+
 `make install` creates the service account, installs and indexes a dedicated
 Postfix transport map, adds it to the existing `transport_maps` value, installs
 the `master.cf` pipe, and enables the worker as a dependency of `salyut-bbsd`.
 These operations are skipped for staged `DESTDIR` installs.
 
-Do not add `bbs.salyut.one` to `relay_domains`: the reply routes are intended
-for mail submitted by local users, not Internet senders.
+Do not add `bbs.salyut.one` to `relay_domains`: board posts require authenticated
+submission, while reply capability routes are intended for local users rather
+than Internet senders.
 
 ## Deploying
 

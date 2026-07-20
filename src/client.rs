@@ -198,6 +198,26 @@ impl Client {
         }
     }
 
+    pub fn import_mail_post(
+        &self,
+        board: &str,
+        username: &str,
+        message_id: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<(i64, bool)> {
+        match self.call(&Request::MailImportPost {
+            board: board.to_owned(),
+            username: username.to_owned(),
+            message_id: message_id.to_owned(),
+            title: title.to_owned(),
+            body: body.to_owned(),
+        })? {
+            Response::MailPostAccepted { post_id, duplicate } => Ok((post_id, duplicate)),
+            response => result_error(response),
+        }
+    }
+
     pub fn unsubscribe_mail_token(&self, token: &str) -> Result<String> {
         match self.call(&Request::MailUnsubscribe {
             token: token.to_owned(),

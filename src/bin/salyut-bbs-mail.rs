@@ -35,6 +35,8 @@ enum MailCommand {
     Receive {
         #[arg(long)]
         recipient: String,
+        #[arg(long, default_value = "")]
+        sasl_username: String,
     },
 }
 
@@ -43,7 +45,10 @@ fn main() -> Result<()> {
     let client = Client::new(arguments.socket);
     match arguments.command {
         MailCommand::Deliver { sendmail, once } => deliver(&client, &sendmail, once),
-        MailCommand::Receive { recipient } => receive(&client, &recipient, io::stdin()),
+        MailCommand::Receive {
+            recipient,
+            sasl_username,
+        } => receive(&client, &recipient, &sasl_username, io::stdin()),
     }
 }
 
@@ -136,7 +141,7 @@ fn render_message(delivery: &MailDelivery) -> Result<String> {
     ))
 }
 
-fn receive(client: &Client, recipient: &str, input: impl Read) -> Result<()> {
+fn receive(client: &Client, recipient: &str, sasl_username: &str, input: impl Read) -> Result<()> {
     let route = parse_recipient(recipient)?;
     let mut raw = Vec::new();
     input
@@ -147,6 +152,22 @@ fn receive(client: &Client, recipient: &str, input: impl Read) -> Result<()> {
         bail!("message exceeds {MAX_MESSAGE_BYTES} bytes");
     }
     match route {
+        Route::Post(board) => {
+            let username = authenticated_username(sasl_username)?;
+            let post = parse_mail_post(&raw)?;
+            let (post_id, duplicate) = client.import_mail_post(
+                board,
+                username,
+                &post.message_id,
+                &post.title,
+                &post.body,
+            )?;
+            if duplicate {
+                eprintln!("ignored duplicate mail post #{post_id}");
+            } else {
+                eprintln!("created post #{post_id} in /{board} from authenticated mail");
+            }
+        }
         Route::Unsubscribe(token) => {
             let board = client.unsubscribe_mail_token(token)?;
             eprintln!("unsubscribed mail recipient from /{board}");
@@ -170,6 +191,7 @@ fn receive(client: &Client, recipient: &str, input: impl Read) -> Result<()> {
 }
 
 enum Route<'a> {
+    Post(&'a str),
     Reply(&'a str),
     Unsubscribe(&'a str),
 }
@@ -181,15 +203,59 @@ fn parse_recipient(recipient: &str) -> Result<Route<'_>> {
     if !domain.eq_ignore_ascii_case(MAIL_DOMAIN) {
         bail!("recipient is outside {MAIL_DOMAIN}");
     }
-    let (kind, token) = local
-        .split_once('+')
-        .context("recipient has no route token")?;
+    let Some((kind, token)) = local.split_once('+') else {
+        validate_board_slug(local)?;
+        return Ok(Route::Post(local));
+    };
     validate_token(token)?;
     match kind {
         "reply" => Ok(Route::Reply(token)),
         "unsubscribe" => Ok(Route::Unsubscribe(token)),
         _ => bail!("unknown BBS mail route"),
     }
+}
+
+struct MailPost {
+    message_id: String,
+    title: String,
+    body: String,
+}
+
+fn parse_mail_post(raw: &[u8]) -> Result<MailPost> {
+    let parsed = mailparse::parse_mail(raw).context("parse MIME message")?;
+    reject_automatic_message(&parsed)?;
+    let message_id = parsed
+        .headers
+        .get_first_value("Message-ID")
+        .context("message has no Message-ID")?;
+    let title = parsed
+        .headers
+        .get_first_value("Subject")
+        .context("message has no Subject")?
+        .trim()
+        .to_owned();
+    if title.is_empty() {
+        bail!("message Subject is empty");
+    }
+    let body = plain_text_body(&parsed)?.context("message has no text/plain body")?;
+    let body = body.replace("\r\n", "\n").replace('\r', "\n");
+    let body = body.trim().to_owned();
+    if body.is_empty() {
+        bail!("mail post body is empty");
+    }
+    Ok(MailPost {
+        message_id,
+        title,
+        body,
+    })
+}
+
+fn authenticated_username(username: &str) -> Result<&str> {
+    if username.is_empty() {
+        bail!("posting by email requires authenticated SMTP submission");
+    }
+    validate_local_username(username)?;
+    Ok(username)
 }
 
 fn reject_automatic_message(message: &ParsedMail<'_>) -> Result<()> {
@@ -246,6 +312,18 @@ fn validate_token(token: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_board_slug(slug: &str) -> Result<()> {
+    if slug.is_empty()
+        || slug.len() > 64
+        || !slug
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("invalid board address");
+    }
+    Ok(())
+}
+
 fn validate_local_username(username: &str) -> Result<()> {
     if username.is_empty()
         || !username
@@ -269,7 +347,10 @@ fn sanitize_header(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAIL_DOMAIN, REPLY_MARKER, Route, parse_recipient, render_message, reply_text};
+    use super::{
+        MAIL_DOMAIN, REPLY_MARKER, Route, authenticated_username, parse_mail_post, parse_recipient,
+        render_message, reply_text,
+    };
     use salyut_bbs::protocol::MailDelivery;
 
     fn delivery() -> MailDelivery {
@@ -312,7 +393,41 @@ mod tests {
             parse_recipient(&address).unwrap(),
             Route::Reply(_)
         ));
-        assert!(parse_recipient("general@bbs.salyut.one").is_err());
+        assert!(matches!(
+            parse_recipient("updates@bbs.salyut.one").unwrap(),
+            Route::Post("updates")
+        ));
+        assert!(parse_recipient("Updates@bbs.salyut.one").is_err());
+        assert!(parse_recipient("updates+invalid@bbs.salyut.one").is_err());
         assert!(parse_recipient(&format!("reply+{}@example.com", "c".repeat(64))).is_err());
+    }
+
+    #[test]
+    fn new_post_requires_authenticated_smtp_and_plain_text() {
+        assert!(authenticated_username("").is_err());
+        assert_eq!(authenticated_username("alice").unwrap(), "alice");
+        let message = b"From: Alice <alice@salyut.one>\r\n\
+            To: updates@bbs.salyut.one\r\n\
+            Subject: Planned maintenance\r\n\
+            Message-ID: <maintenance-1@salyut.one>\r\n\
+            MIME-Version: 1.0\r\n\
+            Content-Type: text/plain; charset=UTF-8\r\n\
+            \r\n\
+            Services will restart tonight.\r\n";
+        let post = parse_mail_post(message).unwrap();
+        assert_eq!(post.message_id, "<maintenance-1@salyut.one>");
+        assert_eq!(post.title, "Planned maintenance");
+        assert_eq!(post.body, "Services will restart tonight.");
+    }
+
+    #[test]
+    fn automatic_mail_cannot_create_a_post() {
+        let message = b"Subject: Automatic\r\n\
+            Message-ID: <automatic@salyut.one>\r\n\
+            Auto-Submitted: auto-generated\r\n\
+            Content-Type: text/plain\r\n\
+            \r\n\
+            Do not post this.\r\n";
+        assert!(parse_mail_post(message).is_err());
     }
 }
