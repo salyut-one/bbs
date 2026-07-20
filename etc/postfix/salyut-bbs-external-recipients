@@ -1,0 +1,3 @@
+# Permit unauthenticated SMTP only for boards that accept email-created threads.
+general@bbs.salyut.one OK
+updates@bbs.salyut.one OK

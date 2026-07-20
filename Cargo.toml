@@ -9,7 +9,7 @@ description = "A Unix-native BBS for pubnix communities"
 default = ["daemon", "tui", "mail"]
 daemon = ["dep:clap", "dep:libc", "dep:rusqlite"]
 tui = ["dep:clap", "dep:crossterm", "dep:ratatui"]
-mail = ["dep:clap", "dep:mailparse"]
+mail = ["dep:clap", "dep:libc", "dep:mailparse"]
 
 [dependencies]
 anyhow = "1.0"
@@ -36,6 +36,11 @@ required-features = ["daemon"]
 [[bin]]
 name = "salyut-bbs-mail"
 path = "src/bin/salyut-bbs-mail.rs"
+required-features = ["mail"]
+
+[[bin]]
+name = "salyut-bbs-forwardd"
+path = "src/bin/salyut-bbs-forwardd.rs"
 required-features = ["mail"]
 
 [profile.release]

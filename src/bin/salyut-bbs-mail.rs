@@ -1,5 +1,6 @@
 use std::{
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -8,18 +9,26 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use mailparse::{DispositionType, MailHeaderMap, ParsedMail};
+use mailparse::{DispositionType, MailAddr, MailHeaderMap, ParsedMail};
 use salyut_bbs::{client::Client, protocol::MailDelivery};
 
 const MAX_MESSAGE_BYTES: u64 = 512 * 1024;
+const MAX_LOOKUP_RESPONSE_BYTES: u64 = 512;
 const REPLY_MARKER: &str = "--- reply above this line ---";
 const MAIL_DOMAIN: &str = "bbs.salyut.one";
+const AUTHENTICATION_SERVICE: &str = "mail.salyut.one";
 
 #[derive(Parser)]
 #[command(version, about = "Postfix bridge for the salyut.one BBS")]
 struct Arguments {
     #[arg(long, default_value_os_t = salyut_bbs::paths::read_write_socket())]
     socket: PathBuf,
+    #[arg(
+        long,
+        default_value = "/run/salyut-bbs/users/forward-map.sock",
+        global = true
+    )]
+    forward_map_socket: PathBuf,
     #[command(subcommand)]
     command: MailCommand,
 }
@@ -48,7 +57,13 @@ fn main() -> Result<()> {
         MailCommand::Receive {
             recipient,
             sasl_username,
-        } => receive(&client, &recipient, &sasl_username, io::stdin()),
+        } => receive(
+            &client,
+            &arguments.forward_map_socket,
+            &recipient,
+            &sasl_username,
+            io::stdin(),
+        ),
     }
 }
 
@@ -141,7 +156,13 @@ fn render_message(delivery: &MailDelivery) -> Result<String> {
     ))
 }
 
-fn receive(client: &Client, recipient: &str, sasl_username: &str, input: impl Read) -> Result<()> {
+fn receive(
+    client: &Client,
+    forward_map_socket: &Path,
+    recipient: &str,
+    sasl_username: &str,
+    input: impl Read,
+) -> Result<()> {
     let route = parse_recipient(recipient)?;
     let mut raw = Vec::new();
     input
@@ -153,11 +174,11 @@ fn receive(client: &Client, recipient: &str, sasl_username: &str, input: impl Re
     }
     match route {
         Route::Post(board) => {
-            let username = authenticated_username(sasl_username)?;
             let post = parse_mail_post(&raw)?;
+            let username = posting_username(sasl_username, &raw, forward_map_socket)?;
             let (post_id, duplicate) = client.import_mail_post(
                 board,
-                username,
+                &username,
                 &post.message_id,
                 &post.title,
                 &post.body,
@@ -165,7 +186,7 @@ fn receive(client: &Client, recipient: &str, sasl_username: &str, input: impl Re
             if duplicate {
                 eprintln!("ignored duplicate mail post #{post_id}");
             } else {
-                eprintln!("created post #{post_id} in /{board} from authenticated mail");
+                eprintln!("created post #{post_id} in /{board} from verified mail");
             }
         }
         Route::Unsubscribe(token) => {
@@ -258,6 +279,129 @@ fn authenticated_username(username: &str) -> Result<&str> {
     Ok(username)
 }
 
+fn posting_username(sasl_username: &str, raw: &[u8], forward_map_socket: &Path) -> Result<String> {
+    if !sasl_username.is_empty() {
+        return authenticated_username(sasl_username).map(str::to_owned);
+    }
+    let message = mailparse::parse_mail(raw).context("parse MIME message")?;
+    let address = verified_external_sender(&message)?;
+    lookup_forwarding_user(forward_map_socket, &address)
+}
+
+fn verified_external_sender(message: &ParsedMail<'_>) -> Result<String> {
+    let from_headers: Vec<_> = message
+        .headers
+        .iter()
+        .filter(|header| header.get_key_ref().eq_ignore_ascii_case("From"))
+        .collect();
+    if from_headers.len() != 1 {
+        bail!("external mail must contain exactly one From header");
+    }
+    let addresses =
+        mailparse::addrparse_header(from_headers[0]).context("parse external From header")?;
+    if addresses.len() != 1 {
+        bail!("external mail From must contain exactly one mailbox");
+    }
+    let MailAddr::Single(sender) = &addresses[0] else {
+        bail!("external mail From must not be a group");
+    };
+    let (_, domain) = sender
+        .addr
+        .rsplit_once('@')
+        .context("external From address has no domain")?;
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    let authenticated = message.headers.iter().any(|header| {
+        header
+            .get_key_ref()
+            .eq_ignore_ascii_case("Authentication-Results")
+            && authentication_result_passes(&header.get_value(), &domain)
+    });
+    if !authenticated {
+        bail!("external mail requires an aligned DKIM pass from {AUTHENTICATION_SERVICE}");
+    }
+    salyut_bbs::forward_map::normalize_address(&sender.addr)
+}
+
+fn authentication_result_passes(value: &str, sender_domain: &str) -> bool {
+    let mut parts = value.split(';');
+    if !parts
+        .next()
+        .is_some_and(|part| part.trim().eq_ignore_ascii_case(AUTHENTICATION_SERVICE))
+    {
+        return false;
+    }
+    parts.any(|result| {
+        let result = remove_comments(result);
+        let mut passed = false;
+        let mut signing_domain = None;
+        for token in result.split_ascii_whitespace() {
+            let token = token.trim_matches('"');
+            if token.eq_ignore_ascii_case("dkim=pass") {
+                passed = true;
+            } else if let Some(value) = token
+                .strip_prefix("header.d=")
+                .or_else(|| token.strip_prefix("HEADER.D="))
+            {
+                signing_domain = Some(value.trim_matches('"').trim_end_matches('.'));
+            }
+        }
+        passed && signing_domain.is_some_and(|domain| domain.eq_ignore_ascii_case(sender_domain))
+    })
+}
+
+fn remove_comments(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut depth = 0_u32;
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            escaped = false;
+            if depth == 0 {
+                output.push(character);
+            }
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            if depth == 0 {
+                output.push(character);
+            }
+            continue;
+        }
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => output.push(character),
+            _ => {}
+        }
+    }
+    output
+}
+
+fn lookup_forwarding_user(socket: &Path, address: &str) -> Result<String> {
+    if address.contains(['\r', '\n', '\0']) {
+        bail!("invalid external sender address");
+    }
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("connect forwarding map {}", socket.display()))?;
+    stream
+        .write_all(format!("{address}\n").as_bytes())
+        .context("query forwarding map")?;
+    let mut response = String::new();
+    BufReader::new(stream)
+        .take(MAX_LOOKUP_RESPONSE_BYTES + 1)
+        .read_line(&mut response)
+        .context("read forwarding map response")?;
+    if response.len() as u64 > MAX_LOOKUP_RESPONSE_BYTES {
+        bail!("forwarding map response is too large");
+    }
+    let Some(username) = response.trim_end().strip_prefix("OK ") else {
+        bail!("external From address is not registered in a local .forward file");
+    };
+    validate_local_username(username)?;
+    Ok(username.to_owned())
+}
+
 fn reject_automatic_message(message: &ParsedMail<'_>) -> Result<()> {
     if let Some(value) = message.headers.get_first_value("Auto-Submitted")
         && !value.eq_ignore_ascii_case("no")
@@ -348,8 +492,8 @@ fn sanitize_header(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAIL_DOMAIN, REPLY_MARKER, Route, authenticated_username, parse_mail_post, parse_recipient,
-        render_message, reply_text,
+        MAIL_DOMAIN, REPLY_MARKER, Route, authenticated_username, authentication_result_passes,
+        parse_mail_post, parse_recipient, render_message, reply_text, verified_external_sender,
     };
     use salyut_bbs::protocol::MailDelivery;
 
@@ -418,6 +562,47 @@ mod tests {
         assert_eq!(post.message_id, "<maintenance-1@salyut.one>");
         assert_eq!(post.title, "Planned maintenance");
         assert_eq!(post.body, "Services will restart tonight.");
+    }
+
+    #[test]
+    fn external_sender_requires_local_aligned_dkim_result() {
+        let message = b"From: Alice <alice@example.com>\r\n\
+            Authentication-Results: mail.salyut.one; dkim=pass (good) header.d=example.com header.i=@example.com\r\n\
+            Subject: External\r\n\
+            Message-ID: <external@example.com>\r\n\
+            Content-Type: text/plain\r\n\
+            \r\n\
+            Verified.\r\n";
+        let parsed = mailparse::parse_mail(message).unwrap();
+        assert_eq!(
+            verified_external_sender(&parsed).unwrap(),
+            "alice@example.com"
+        );
+
+        let forged = b"From: Alice <alice@example.com>\r\n\
+            Authentication-Results: attacker.example; dkim=pass header.d=example.com\r\n\
+            Subject: Forged\r\n\
+            Message-ID: <forged@example.com>\r\n\
+            Content-Type: text/plain\r\n\
+            \r\n\
+            Forged.\r\n";
+        assert!(verified_external_sender(&mailparse::parse_mail(forged).unwrap()).is_err());
+    }
+
+    #[test]
+    fn dkim_result_must_align_with_the_from_domain() {
+        assert!(authentication_result_passes(
+            "mail.salyut.one; dkim=pass header.d=example.com header.i=@example.com",
+            "example.com"
+        ));
+        assert!(!authentication_result_passes(
+            "mail.salyut.one; dkim=pass header.d=sender.example",
+            "example.com"
+        ));
+        assert!(!authentication_result_passes(
+            "mail.salyut.one; dkim=fail (dkim=pass header.d=example.com) header.d=example.com",
+            "example.com"
+        ));
     }
 
     #[test]

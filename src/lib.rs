@@ -1,6 +1,8 @@
 pub mod client;
 #[cfg(feature = "daemon")]
 pub mod db;
+#[cfg(feature = "mail")]
+pub mod forward_map;
 pub mod paths;
 #[cfg(feature = "daemon")]
 pub mod peer;
